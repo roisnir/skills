@@ -1,0 +1,13 @@
+{
+  "projects": [
+    {
+      "repo": "roisnir/CompuDesk",
+      "project_number": 1,
+      "project_id": "PVT_kwHOAV4V_c4BYNfT",
+      "status_field_id": "PVTSSF_lAHOAV4V_c4BYNfTzhTU6K8",
+      "path": "/data/dev/compugate/compudesk_v2",
+      "worktrees": "/data/dev/compugate/cd-wt",
+      "notes": "UI-feature briefs must include an RTL (Hebrew) mockup."
+    }
+  ]
+}
