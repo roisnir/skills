@@ -20,6 +20,7 @@ from pathlib import Path
 
 MODEL    = "opus"
 IGNORE   = "ultra-ralph"            # skip issues/PRs with this label, this session
+PRODUCT_LABEL = "product-approved"  # stamped when the product phase is agreed with the reporter
 RALPH_SH = "/data/dev/skills/ralph.sh"
 OTEL_ENDPOINT = "http://192.168.11.155:4317"
 
@@ -98,14 +99,33 @@ Hard rule: IGNORE every issue and PR labeled `{IGNORE}` — do not read, triage,
 Propagate it: EVERY claude process or sub-agent you spawn MUST include this sentence verbatim in
 its prompt -> "Ignore anything labeled `{IGNORE}`; never read, modify, or open a PR against it."
 
-1. Triage items whose Status is `Backlog` or `Needs Triage` (use /triage). For each: either move to
-   `Ready For Agent` with a clear implementation brief (post the brief as an issue comment), or move
-   to `Needs Info` / `Ready For Human` with why.
-   - Follow the brief/implementation conventions documented in this repo's CLAUDE.md (mockup style,
-     language/RTL, layout). If CLAUDE.md requires a mockup for UI features, the brief MUST include one.
-   - If an issue is too large for one PR, split it with /to-issues instead of briefing it.{notes}
+Triage is TWO phases: agree on WHAT the feature is with the reporter (product), THEN plan HOW it
+fits the codebase (technical). The `{PRODUCT_LABEL}` label marks that the product phase is settled —
+never re-open the product discussion on an item that already has it.
 
-2. Dispatch: for each item with Status `Ready For Agent` that ALSO has a human (non-AI-generated)
+1. PRODUCT phase — for items with Status `Backlog` or `Needs Triage` that do NOT have the
+   `{PRODUCT_LABEL}` label (use /triage): agree on WHAT the feature is, in plain language, BEFORE any
+   technical detail. Post a "Product Brief" comment — Problem / Who it affects / What "done" looks
+   like to a user / Out of scope — describe BEHAVIOUR, not implementation (no files, APIs, or
+   architecture). For a UI feature, ALSO post a self-contained HTML mockup of the feature inline in
+   the comment so the reporter can see and agree on the look and layout before anything is built
+   (the mockup is a visual, not implementation — the one allowed exception to "no code"); follow this
+   repo's CLAUDE.md for mockup conventions (e.g. language/RTL). End by asking the reporter to confirm
+   or correct. Set Status `Needs Info` (ball in the reporter's court). If it is
+   too unclear to even draft one, ask the blocking question and set `Needs Info`. Use `Ready For
+   Human` for anything needing a human DECISION rather than reporter input.
+
+2. TECHNICAL phase — for items with Status `Needs Info` where the reporter has replied to a Product
+   Brief: if they corrected it, revise the brief and stay `Needs Info`. If they CONFIRMED, then:
+   - Stamp the agreement: `gh issue edit <n> -R {repo} --add-label {PRODUCT_LABEL}` (create it first
+     if missing: `gh label create {PRODUCT_LABEL} -R {repo} --color 0E8A16 --description "product
+     requirements agreed with reporter" 2>/dev/null || true`).
+   - Post a "Technical Plan" comment: how it integrates into the codebase (affected files/layers,
+     API, tests) and, for a UI feature, how it realizes the agreed HTML mockup from the Product
+     Brief. Follow this repo's CLAUDE.md conventions. If too large for one PR, split with /to-issues.
+   - Set Status `Ready For Agent`.{notes}
+
+3. Dispatch: for each item with Status `Ready For Agent` that ALSO has a human (non-AI-generated)
    comment saying "approved". Each feature is implemented in its OWN git worktree so several can
    run concurrently. Before dispatching, count items with Status `In progress` in this project: if
    that is already {CONCURRENCY} or more, dispatch nothing this pass (the slots are full).
@@ -282,6 +302,9 @@ def selftest():
     s = build_instruction(p, {"Done": "opt9"})
     assert "acme/widget" in s and "RTL Hebrew mockups." in s and "/tmp/widget-wt" in s
     assert "Done=opt9" in s and RALPH_SH in s and "CompuDesk" not in s
+    # two-phase triage: product gate stamps the label before the technical phase
+    assert PRODUCT_LABEL in s and "PRODUCT phase" in s and "TECHNICAL phase" in s
+    assert "HTML mockup" in s  # UI features get a visual mockup in the product phase
     # lock acquire -> reject second -> release
     global LOCK
     LOCK = STATE / "selftest.lock"
