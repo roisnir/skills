@@ -10,11 +10,13 @@
       "notes": "UI-feature briefs must include an RTL (Hebrew) mockup."
     },
     {
-      "repo": "roisnir/telegram-ai-digest",
       "project_number": 3,
       "project_id": "PVT_kwHOAV4V_c4BblgN",
       "status_field_id": "PVTSSF_lAHOAV4V_c4BblgNzhWVBBU",
-      "path": "/data/dev/daily_news_digest/telegram-ai-digest"
+      "repos": {
+        "roisnir/telegram-ai-digest": "/data/dev/daily_news_digest/telegram-ai-digest",
+        "roisnir/weekly-newsletter": "/data/dev/daily_news_digest/weekly-storage-updates"
+      }
     }
   ]
 }

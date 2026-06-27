@@ -35,14 +35,35 @@ CONFIG      = STATE / "projects.json"
 
 
 # ── project config ────────────────────────────────────────────────────────────
+def _norm_repo(repo, val):
+    """Normalize a repo spec: a bare path string or {path, worktrees} -> {path, worktrees, owner}."""
+    spec = {"path": val} if isinstance(val, str) else dict(val)
+    if not spec.get("path"):
+        sys.exit(f"repo {repo} missing local path")
+    spec.setdefault("worktrees", str(Path(spec["path"]).parent / (Path(spec["path"]).name + "-wt")))
+    spec["owner"] = repo.split("/")[0]
+    return spec
+
+
 def normalize(p):
-    """Fill derived/default fields on a project dict."""
-    missing = [k for k in ("repo", "project_number", "project_id", "status_field_id", "path") if not p.get(k)]
-    if missing:
-        sys.exit(f"project config missing {missing}: {p}")
+    """Canonicalize a project: one Project (board) may span several repos.
+
+    Accepts `repos: {owner/name: path | {path, worktrees}}`, or the single-repo
+    shorthand `repo` + `path` (+ optional `worktrees`). `owner` is the Project
+    owner (defaults to the first repo's owner; override for org-owned boards)."""
+    for k in ("project_number", "project_id", "status_field_id"):
+        if not p.get(k):
+            sys.exit(f"project config missing {k}: {p}")
+    if p.get("repo"):                                  # single-repo shorthand -> repos map
+        spec = {"path": p.get("path")}
+        if p.get("worktrees"):
+            spec["worktrees"] = p["worktrees"]
+        p.setdefault("repos", {})[p["repo"]] = spec
+    if not p.get("repos"):
+        sys.exit(f"project {p.get('project_number')} has no repos")
+    p["repos"] = {r: _norm_repo(r, v) for r, v in p["repos"].items()}
     p.setdefault("notes", "")
-    p.setdefault("worktrees", str(Path(p["path"]).parent / (Path(p["path"]).name + "-wt")))
-    p["owner"] = p["repo"].split("/")[0]
+    p["owner"] = p.get("owner") or next(iter(p["repos"])).split("/")[0]
     return p
 
 
@@ -79,13 +100,22 @@ def project_items(p):
 # ── instruction ────────────────────────────────────────────────────────────────
 def build_instruction(p, opts):
     optline = ", ".join(f"{k}={v}" for k, v in opts.items())
-    repo, owner, num = p["repo"], p["owner"], p["project_number"]
-    pid, fid, wts = p["project_id"], p["status_field_id"], p["worktrees"]
+    owner, num = p["owner"], p["project_number"]
+    pid, fid = p["project_id"], p["status_field_id"]
     notes = f"\n   - Project-specific notes: {p['notes']}" if p.get("notes") else ""
-    return f"""You are the triage+dispatch orchestrator for repo {repo}.
-Run ONE full pass, then exit (an outer loop re-invokes you on the next trigger).
+    repolines = "\n".join(f"  - {r}: local clone {spec['path']}, worktrees under {spec['worktrees']}"
+                          for r, spec in p["repos"].items())
+    routing = ("This Project spans MULTIPLE repos. Every project item carries its own repo in "
+               "`content.repository` (from item-list) — do ALL git, PR, label, and worktree work in "
+               "THAT repo, using its clone/worktrees path below:" if len(p["repos"]) > 1
+               else "All items in this Project belong to one repo:")
+    return f"""You are the triage+dispatch orchestrator for GitHub Project #{num} (owner {owner}).
+Run ONE full pass over the whole board, then exit (an outer loop re-invokes you on the next trigger).
 
-Triage state lives in GitHub Project #{num} (owner {owner}) Status field, NOT in labels.
+{routing}
+{repolines}
+
+Triage state lives in the Project Status field, NOT in labels.
 To set a status: `gh project item-edit --id <ITEM_ID> --project-id {pid} --field-id {fid} --single-select-option-id <OPT>`
 where <ITEM_ID> is the project item id from `gh project item-list {num} --owner {owner} --format json`
 and <OPT> is the option id for the target status (live ids): {optline}.
@@ -109,30 +139,33 @@ never re-open the product discussion on an item that already has it.
    like to a user / Out of scope — describe BEHAVIOUR, not implementation (no files, APIs, or
    architecture). For a UI feature, ALSO post a self-contained HTML mockup of the feature inline in
    the comment so the reporter can see and agree on the look and layout before anything is built
-   (the mockup is a visual, not implementation — the one allowed exception to "no code"); follow this
-   repo's CLAUDE.md for mockup conventions (e.g. language/RTL). End by asking the reporter to confirm
-   or correct. Set Status `Needs Info` (ball in the reporter's court). If it is
+   (the mockup is a visual, not implementation — the one allowed exception to "no code"); follow the
+   item's repo CLAUDE.md for mockup conventions (e.g. language/RTL). End by asking the reporter to
+   confirm or correct. Set Status `Needs Info` (ball in the reporter's court). If it is
    too unclear to even draft one, ask the blocking question and set `Needs Info`. Use `Ready For
    Human` for anything needing a human DECISION rather than reporter input.
 
 2. TECHNICAL phase — for items with Status `Needs Info` where the reporter has replied to a Product
    Brief: if they corrected it, revise the brief and stay `Needs Info`. If they CONFIRMED, then:
-   - Stamp the agreement: `gh issue edit <n> -R {repo} --add-label {PRODUCT_LABEL}` (create it first
-     if missing: `gh label create {PRODUCT_LABEL} -R {repo} --color 0E8A16 --description "product
-     requirements agreed with reporter" 2>/dev/null || true`).
-   - Post a "Technical Plan" comment: how it integrates into the codebase (affected files/layers,
-     API, tests) and, for a UI feature, how it realizes the agreed HTML mockup from the Product
-     Brief. Follow this repo's CLAUDE.md conventions. If too large for one PR, split with /to-issues.
+   - Stamp the agreement on the item's repo: `gh issue edit <n> -R <item repo> --add-label
+     {PRODUCT_LABEL}` (create it first if missing: `gh label create {PRODUCT_LABEL} -R <item repo>
+     --color 0E8A16 --description "product requirements agreed with reporter" 2>/dev/null || true`).
+   - Post a "Technical Plan" comment: how it integrates into that repo's codebase (affected
+     files/layers, API, tests) and, for a UI feature, how it realizes the agreed HTML mockup from the
+     Product Brief. Follow the item's repo CLAUDE.md conventions. If too large for one PR, split with
+     /to-issues. If it needs coordinated changes across repos, split into one linked issue per repo
+     (sequenced by dependency) — never one PR spanning repos.
    - Set Status `Ready For Agent`.{notes}
 
 3. Dispatch: for each item with Status `Ready For Agent` that ALSO has a human (non-AI-generated)
-   comment saying "approved". Each feature is implemented in its OWN git worktree so several can
-   run concurrently. Before dispatching, count items with Status `In progress` in this project: if
-   that is already {CONCURRENCY} or more, dispatch nothing this pass (the slots are full).
+   comment saying "approved". Each feature is implemented in its OWN git worktree, in the item's
+   repo, so several can run concurrently. Before dispatching, count items with Status `In progress`
+   across the board: if that is already {CONCURRENCY} or more, dispatch nothing this pass (slots full).
    For each approvable item, up to the {CONCURRENCY} cap:
      - Skip it if its Status is already `In progress` (in flight) or it already has an open PR.
-     - Create an isolated worktree: `git worktree add {wts}/<slug> -b feat/<n>-<slug>`
-       (branch off origin/master, in repo {p["path"]}). Set Status to `In progress`.
+     - In the item's repo clone, create an isolated worktree under that repo's worktrees base:
+       `git worktree add <worktrees base>/<slug> -b feat/<n>-<slug>` (branch off origin/master).
+       Set Status to `In progress`.
      - Use the item's Size field to route: XS/S/M -> SMALL path, L/XL -> LARGE path (if Size is
        empty, judge from the brief).
      - a. SMALL feature -> launch a SEPARATE backgrounded claude process (not an in-process agent,
@@ -166,18 +199,19 @@ def env():
 
 # ── triggers / state ────────────────────────────────────────────────────────────
 def gh_fingerprint(projects):
-    """{repo+kind+number: updatedAt} for open issues+PRs across all repos, excluding the ignore label."""
+    """{repo+kind+number: updatedAt} for open issues+PRs across every repo, excluding the ignore label."""
     fp = {}
     for p in projects:
-        for kind in ("issue", "pr"):
-            out = subprocess.run(
-                ["gh", kind, "list", "-R", p["repo"], "--state", "open", "--limit", "200",
-                 "--json", "number,updatedAt,labels"],
-                capture_output=True, text=True)
-            for it in json.loads(out.stdout or "[]"):
-                if any(l["name"] == IGNORE for l in it.get("labels", [])):
-                    continue
-                fp[f"{p['repo']}{kind}{it['number']}"] = it["updatedAt"]
+        for repo in p["repos"]:
+            for kind in ("issue", "pr"):
+                out = subprocess.run(
+                    ["gh", kind, "list", "-R", repo, "--state", "open", "--limit", "200",
+                     "--json", "number,updatedAt,labels"],
+                    capture_output=True, text=True)
+                for it in json.loads(out.stdout or "[]"):
+                    if any(l["name"] == IGNORE for l in it.get("labels", [])):
+                        continue
+                    fp[f"{repo}{kind}{it['number']}"] = it["updatedAt"]
     return fp
 
 
@@ -212,31 +246,37 @@ def _ci(rollup):
     return "pass"
 
 
+def _repo_ctx(repo, path):
+    """(open PRs, branch->worktree-path map) for one repo, for the status join."""
+    prs = _json(["gh", "pr", "list", "-R", repo, "--state", "open", "--limit", "200",
+                 "--json", "number,headRefName,statusCheckRollup"])
+    wt, wpath = {}, None
+    for line in subprocess.run(["git", "-C", path, "worktree", "list", "--porcelain"],
+                               capture_output=True, text=True).stdout.splitlines():
+        if line.startswith("worktree "):
+            wpath = line[9:]
+        elif line.startswith("branch "):
+            wt[line[7:].replace("refs/heads/", "")] = wpath
+    return prs, wt
+
+
 def write_status(projects):
-    """Join project items -> worktree -> PR -> CI on the feat/<n>- branch prefix, all repos."""
+    """Join project items -> worktree -> PR -> CI on the feat/<n>- branch prefix, per item's repo."""
     rows = ["| repo | issue | status | size/prio | worktree | PR | CI |",
             "|---|---|---|---|---|---|---|"]
     for p in projects:
-        prs = _json(["gh", "pr", "list", "-R", p["repo"], "--state", "open", "--limit", "200",
-                     "--json", "number,headRefName,statusCheckRollup"])
-        # branch -> worktree path (worktrees of this project's local repo)
-        wt, path = {}, None
-        for line in subprocess.run(["git", "-C", p["path"], "worktree", "list", "--porcelain"],
-                                   capture_output=True, text=True).stdout.splitlines():
-            if line.startswith("worktree "):
-                path = line[9:]
-            elif line.startswith("branch "):
-                wt[line[7:].replace("refs/heads/", "")] = path
-
-        short = p["repo"].split("/")[-1]
+        ctx = {repo: _repo_ctx(repo, spec["path"]) for repo, spec in p["repos"].items()}
         for it in sorted(project_items(p), key=lambda x: x["content"]["number"]):
             if it.get("status") == "Done":
                 continue
+            repo = it["content"].get("repository")
+            prs, wt = ctx.get(repo, ([], {}))
             n = it["content"]["number"]
             pre = f"feat/{n}-"
             wtp = next((q for b, q in wt.items() if b.startswith(pre)), None)
             pr = next((q for q in prs if q["headRefName"].startswith(pre)), None)
-            rows.append(f"| {short} | #{n} {it.get('title','')[:28]} | {it.get('status') or '—'} | "
+            rows.append(f"| {repo.split('/')[-1] if repo else '—'} | #{n} {it.get('title','')[:28]} | "
+                        f"{it.get('status') or '—'} | "
                         f"{it.get('size') or '—'}/{it.get('priority') or '—'} | "
                         f"{Path(wtp).name if wtp else '—'} | "
                         f"{'#'+str(pr['number']) if pr else '—'} | "
@@ -290,18 +330,27 @@ def selftest():
     assert _ci([{"conclusion": "FAILURE"}]) == "fail"
     a = {"issue1": "t0", "pr2": "t0"}
     assert a == dict(a) and a != {**a, "issue1": "t1"}  # change detection is dict-inequality
-    # project normalize: derives owner + default worktrees, requires the core ids
-    p = normalize({"repo": "acme/widget", "project_number": 2, "project_id": "PID",
-                   "status_field_id": "FID", "path": "/tmp/widget", "notes": "RTL Hebrew mockups."})
-    assert p["owner"] == "acme" and p["worktrees"] == "/tmp/widget-wt"
+    # single-repo shorthand: derives owner + default worktrees, requires core ids
+    q = normalize({"repo": "x/y", "project_number": 1, "project_id": "P",
+                   "status_field_id": "F", "path": "/tmp/x"})
+    assert list(q["repos"]) == ["x/y"] and q["owner"] == "x"
+    assert q["repos"]["x/y"]["worktrees"] == "/tmp/x-wt"
     try:
         normalize({"repo": "x/y"}); assert False, "should reject missing ids"
     except SystemExit:
         pass
-    # instruction is generic + carries this project's ids, paths, notes — no hardcoded app name
+    # multi-repo board: a project spanning two repos (bare path + {path,worktrees})
+    p = normalize({"project_number": 2, "project_id": "PID", "status_field_id": "FID",
+                   "notes": "RTL Hebrew mockups.",
+                   "repos": {"acme/widget": "/tmp/widget", "acme/api": {"path": "/tmp/api"}}})
+    assert p["owner"] == "acme"
+    assert p["repos"]["acme/widget"]["worktrees"] == "/tmp/widget-wt"
+    assert p["repos"]["acme/api"]["path"] == "/tmp/api" and p["repos"]["acme/api"]["owner"] == "acme"
+    # instruction carries every repo + ids + notes, flags multi-repo routing, no hardcoded app name
     s = build_instruction(p, {"Done": "opt9"})
-    assert "acme/widget" in s and "RTL Hebrew mockups." in s and "/tmp/widget-wt" in s
-    assert "Done=opt9" in s and RALPH_SH in s and "CompuDesk" not in s
+    assert "acme/widget" in s and "acme/api" in s and "/tmp/widget-wt" in s
+    assert "spans MULTIPLE repos" in s and "content.repository" in s
+    assert "RTL Hebrew mockups." in s and "Done=opt9" in s and RALPH_SH in s and "CompuDesk" not in s
     # two-phase triage: product gate stamps the label before the technical phase
     assert PRODUCT_LABEL in s and "PRODUCT phase" in s and "TECHNICAL phase" in s
     assert "HTML mockup" in s  # UI features get a visual mockup in the product phase
