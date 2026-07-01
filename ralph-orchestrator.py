@@ -166,9 +166,15 @@ never re-open the product discussion on an item that already has it.
    - Set Status `Ready For Agent`.{notes}
 
 3. Reconcile, THEN dispatch.
-   FIRST reconcile every item with Status `In progress`: confirm its executor is actually alive. An
-   executor is LIVE only if `pgrep -af "#<n>|feat/<n>-"` finds a running claude/ralph.sh process OR the
-   item already has an open PR. If NEITHER, the executor died (crash, quota, host restart): post a
+   FIRST reconcile every item with Status `In progress`: confirm its executor is actually alive. The
+   reliable signal is the WORKTREE, not the issue number — both SMALL (claude) and LARGE (ralph.sh)
+   executors run with their cwd inside the item's worktree, but ralph.sh's argv is just `/bin/bash
+   ralph.sh` with no issue ref, so a `pgrep` for the issue number gives false "dead" readings. An
+   executor is LIVE if a running process has its cwd at/under the item's worktree — check with
+   readlink (NOT `ls`, which on this host is eza and dereferences the symlink):
+   `{{ for f in /proc/[0-9]*/cwd; do readlink "$f"; done; }} 2>/dev/null | grep -qF "<worktree-path>"`
+   — OR the item has an open PR.
+   If NEITHER, the executor died (crash, quota, host restart): post a
    one-line "⚠️ executor gone — re-dispatching" note, `git worktree remove --force` any stale worktree,
    and set the item back to `Ready For Agent` so it re-enters dispatch below. NEVER leave a dead item
    `In progress` — it wedges a concurrency slot forever (this is the #1 failure mode).
@@ -177,7 +183,7 @@ never re-open the product discussion on an item that already has it.
    so several can run concurrently. Count only items with a LIVE `In progress` executor toward the cap;
    if that is already {CONCURRENCY} or more, dispatch nothing this pass (slots full).
    For each approvable item, up to the {CONCURRENCY} cap:
-     - Skip it if it already has a LIVE executor (per the pgrep check above) or an open PR.
+     - Skip it if it already has a LIVE executor (per the worktree-cwd check above) or an open PR.
      - In the item's repo clone, create an isolated worktree under that repo's worktrees base:
        `git worktree add <worktrees base>/<slug> -b feat/<n>-<slug>` (branch off origin/master).
        Set Status to `In progress`.
@@ -186,8 +192,8 @@ never re-open the product discussion on an item that already has it.
      - a. SMALL feature -> launch a SEPARATE, DETACHED claude process (not an in-process agent, so
           telemetry is tagged correctly AND it outlives this pass) in that worktree, ALWAYS via the
           wrapper so the OTEL usage_mode=ralph tag can't leak (never call bare `claude` for loop work).
-          Detach with setsid + nohup and log to /tmp/impl-<n>.log so a later pass can reconcile it, and
-          KEEP the issue ref + branch in the prompt so the liveness `pgrep` (step 3) can find it:
+          Detach with setsid + nohup and log to /tmp/impl-<n>.log so a later pass can reconcile it
+          (liveness is detected by the executor's cwd = worktree, per step 3):
           `cd <worktree> && setsid nohup {RALPH_CLAUDE} implementer --permission-mode auto --model sonnet -p "Implement GitHub issue <owner/repo>#<n> in this worktree (branch feat/<n>-<slug>) using /tdd, then open a PR. Ignore anything labeled {IGNORE}." > /tmp/impl-<n>.log 2>&1 &`
           Done when CI is green.
      - b. LARGE feature -> spawn an Opus sub-agent (auto mode, prompt includes the ignore-`{IGNORE}`
@@ -380,6 +386,7 @@ def selftest():
     assert "HTML mockup" in s  # UI features get a visual mockup in the product phase
     # dead-executor reconciliation: In-progress items whose executor vanished must be recovered
     assert "Reconcile" in s and "executor gone" in s and "wedges a concurrency slot" in s
+    assert "/proc/[0-9]*/cwd" in s and "readlink" in s  # liveness via readlink on worktree cwd (eza-safe)
     assert "setsid nohup" in s  # SMALL executors detach so they outlive the pass
     # lock acquire -> reject second -> release
     global LOCK
