@@ -22,6 +22,7 @@ MODEL    = "opus"
 IGNORE   = "ultra-ralph"            # skip issues/PRs with this label, this session
 PRODUCT_LABEL = "product-approved"  # stamped when the product phase is agreed with the reporter
 RALPH_SH = "/data/dev/skills/ralph.sh"
+RALPH_CLAUDE = "/data/dev/skills/ralph-claude.sh"  # wrapper: always tags usage_mode=ralph
 OTEL_ENDPOINT = "http://192.168.11.155:4317"
 
 POLL        = 60                   # seconds between GitHub polls
@@ -83,7 +84,10 @@ def status_opts(p):
     """Live {status name: option id} for the Status field — never hardcode (ids change on rename)."""
     d = _json(["gh", "project", "field-list", str(p["project_number"]), "--owner", p["owner"], "--format", "json"])
     fields = d.get("fields", []) if isinstance(d, dict) else d
-    status = next(f for f in fields if f.get("id") == p["status_field_id"])
+    status = next((f for f in fields if f.get("id") == p["status_field_id"]), None)
+    if status is None:  # transient gh hiccup (empty/partial fields) — don't crash the whole loop
+        raise RuntimeError(f"Status field {p['status_field_id']} not in field-list for project "
+                           f"#{p['project_number']} ({len(fields)} fields returned)")
     return {o["name"]: o["id"] for o in status.get("options", [])}
 
 
@@ -169,8 +173,9 @@ never re-open the product discussion on an item that already has it.
      - Use the item's Size field to route: XS/S/M -> SMALL path, L/XL -> LARGE path (if Size is
        empty, judge from the brief).
      - a. SMALL feature -> launch a SEPARATE backgrounded claude process (not an in-process agent,
-          so telemetry is tagged correctly) in that worktree:
-          `OTEL_RESOURCE_ATTRIBUTES="usage_mode=ralph,agent_type=implementer" claude --permission-mode auto --model sonnet -p "<implement issue using /tdd, open a PR. Ignore anything labeled {IGNORE}.>"`
+          so telemetry is tagged correctly) in that worktree, ALWAYS via the wrapper so the OTEL
+          usage_mode=ralph tag can't leak (never call bare `claude` for loop work):
+          `{RALPH_CLAUDE} implementer --permission-mode auto --model sonnet -p "<implement issue using /tdd, open a PR. Ignore anything labeled {IGNORE}.>"`
           Done when CI is green.
      - b. LARGE feature -> spawn an Opus sub-agent (auto mode, prompt includes the ignore-`{IGNORE}`
           sentence) in that worktree to write a feature-scoped prd.json + progress files, then run
@@ -288,9 +293,13 @@ def write_status(projects):
 def run_iteration(projects):
     for p in projects:
         print(f"=== iteration: claude (opus) for project #{p['project_number']} ({', '.join(p['repos'])}) ===", flush=True)
+        try:
+            instruction = build_instruction(p, status_opts(p))
+        except Exception as ex:  # transient gh failure — skip this project, try again next trigger
+            print(f"!! skipping project #{p['project_number']} this pass: {ex}", flush=True)
+            continue
         subprocess.run(
-            ["claude", "-p", build_instruction(p, status_opts(p)), "--model", MODEL,
-             "--permission-mode", "auto"],
+            [RALPH_CLAUDE, "PM", "-p", instruction, "--model", MODEL, "--permission-mode", "auto"],
             env=env())
 
 
@@ -351,6 +360,8 @@ def selftest():
     assert "acme/widget" in s and "acme/api" in s and "/tmp/widget-wt" in s
     assert "spans MULTIPLE repos" in s and "content.repository" in s
     assert "RTL Hebrew mockups." in s and "Done=opt9" in s and RALPH_SH in s and "CompuDesk" not in s
+    # dispatched agents spawn via the wrapper so usage_mode=ralph can't leak to interactive
+    assert RALPH_CLAUDE in s and "bare `claude`" in s
     # two-phase triage: product gate stamps the label before the technical phase
     assert PRODUCT_LABEL in s and "PRODUCT phase" in s and "TECHNICAL phase" in s
     assert "HTML mockup" in s  # UI features get a visual mockup in the product phase

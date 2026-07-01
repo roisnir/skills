@@ -138,7 +138,7 @@ while [ "$i" -le "$MAX_ITERATIONS" ]; do
   echo ""
   echo "═══ Iteration $i — IMPLEMENTER ═══"
 
-  IMPL_OUTPUT=$(OTEL_RESOURCE_ATTRIBUTES="usage_mode=ralph,agent_type=implementer" claude --permission-mode auto --model sonnet -p "$IMPLEMENTER_PROMPT" \
+  IMPL_OUTPUT=$(/data/dev/skills/ralph-claude.sh implementer --permission-mode auto --model sonnet -p "$IMPLEMENTER_PROMPT" \
     2>&1 | tee /dev/stderr) || true
 
   if echo "$IMPL_OUTPUT" | grep -qE "hit your (session )?limit"; then
@@ -160,7 +160,7 @@ while [ "$i" -le "$MAX_ITERATIONS" ]; do
   echo ""
   echo "═══ Iteration $i — VERIFIER ═══"
 
-  VERIFY_OUTPUT=$(OTEL_RESOURCE_ATTRIBUTES="usage_mode=ralph,agent_type=validator" claude --permission-mode auto --model sonnet -p "$VERIFIER_PROMPT" \
+  VERIFY_OUTPUT=$(/data/dev/skills/ralph-claude.sh validator --permission-mode auto --model sonnet -p "$VERIFIER_PROMPT" \
     2>&1 | tee /dev/stderr) || true
 
   if echo "$VERIFY_OUTPUT" | grep -qE "hit your (session )?limit"; then
