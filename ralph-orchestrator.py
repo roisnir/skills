@@ -35,6 +35,10 @@ STATUS_MD   = STATE / "status.md"                  # `watch cat ~/.ralph-orchest
 CONFIG      = STATE / "projects.json"
 
 
+def log(msg):
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}", flush=True)
+
+
 # ── project config ────────────────────────────────────────────────────────────
 def _norm_repo(repo, val):
     """Normalize a repo spec: a bare path string or {path, worktrees} -> {path, worktrees, owner}."""
@@ -287,16 +291,16 @@ def write_status(projects):
                         f"{'#'+str(pr['number']) if pr else '—'} | "
                         f"{_ci(pr['statusCheckRollup']) if pr else '—'} |")
     STATUS_MD.write_text("\n".join(rows) + "\n")
-    print(f"status -> {STATUS_MD}", flush=True)
+    log(f"status -> {STATUS_MD}")
 
 
 def run_iteration(projects):
     for p in projects:
-        print(f"=== iteration: claude (opus) for project #{p['project_number']} ({', '.join(p['repos'])}) ===", flush=True)
+        log(f"=== iteration: claude (opus) for project #{p['project_number']} ({', '.join(p['repos'])}) ===")
         try:
             instruction = build_instruction(p, status_opts(p))
         except Exception as ex:  # transient gh failure — skip this project, try again next trigger
-            print(f"!! skipping project #{p['project_number']} this pass: {ex}", flush=True)
+            log(f"!! skipping project #{p['project_number']} this pass: {ex}")
             continue
         subprocess.run(
             [RALPH_CLAUDE, "PM", "-p", instruction, "--model", MODEL, "--permission-mode", "auto"],
@@ -319,14 +323,14 @@ def main(projects):
     STATE.mkdir(parents=True, exist_ok=True)
     acquire_lock()
     WAKE.touch()
-    print(f"orchestrating {len(projects)} project(s): {', '.join(r for p in projects for r in p['repos'])}", flush=True)
+    log(f"orchestrating {len(projects)} project(s): {', '.join(r for p in projects for r in p['repos'])}")
     while True:
         run_iteration(projects)
         write_status(projects)
         seen, wake_mtime = gh_fingerprint(projects), WAKE.stat().st_mtime  # re-baseline after our run
         reason = wait_for_trigger(projects, seen, wake_mtime)
         write_status(projects)                                             # refresh on every wake
-        print(f"=== trigger: {reason} ===", flush=True)
+        log(f"=== trigger: {reason} ===")
 
 
 def selftest():
