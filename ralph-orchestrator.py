@@ -287,7 +287,7 @@ def write_status(projects):
 
 def run_iteration(projects):
     for p in projects:
-        print(f"=== iteration: claude (opus) for {p['repo']} ===", flush=True)
+        print(f"=== iteration: claude (opus) for project #{p['project_number']} ({', '.join(p['repos'])}) ===", flush=True)
         subprocess.run(
             ["claude", "-p", build_instruction(p, status_opts(p)), "--model", MODEL,
              "--permission-mode", "auto"],
@@ -310,7 +310,7 @@ def main(projects):
     STATE.mkdir(parents=True, exist_ok=True)
     acquire_lock()
     WAKE.touch()
-    print(f"orchestrating {len(projects)} project(s): {', '.join(p['repo'] for p in projects)}", flush=True)
+    print(f"orchestrating {len(projects)} project(s): {', '.join(r for p in projects for r in p['repos'])}", flush=True)
     while True:
         run_iteration(projects)
         write_status(projects)
