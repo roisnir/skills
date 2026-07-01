@@ -165,21 +165,30 @@ never re-open the product discussion on an item that already has it.
      (sequenced by dependency) — never one PR spanning repos.
    - Set Status `Ready For Agent`.{notes}
 
-3. Dispatch: for each item with Status `Ready For Agent` that ALSO has a human (non-AI-generated)
-   comment saying "approved". Each feature is implemented in its OWN git worktree, in the item's
-   repo, so several can run concurrently. Before dispatching, count items with Status `In progress`
-   across the board: if that is already {CONCURRENCY} or more, dispatch nothing this pass (slots full).
+3. Reconcile, THEN dispatch.
+   FIRST reconcile every item with Status `In progress`: confirm its executor is actually alive. An
+   executor is LIVE only if `pgrep -af "#<n>|feat/<n>-"` finds a running claude/ralph.sh process OR the
+   item already has an open PR. If NEITHER, the executor died (crash, quota, host restart): post a
+   one-line "⚠️ executor gone — re-dispatching" note, `git worktree remove --force` any stale worktree,
+   and set the item back to `Ready For Agent` so it re-enters dispatch below. NEVER leave a dead item
+   `In progress` — it wedges a concurrency slot forever (this is the #1 failure mode).
+   THEN dispatch: for each item with Status `Ready For Agent` that ALSO has a human (non-AI-generated)
+   comment saying "approved". Each feature is implemented in its OWN git worktree, in the item's repo,
+   so several can run concurrently. Count only items with a LIVE `In progress` executor toward the cap;
+   if that is already {CONCURRENCY} or more, dispatch nothing this pass (slots full).
    For each approvable item, up to the {CONCURRENCY} cap:
-     - Skip it if its Status is already `In progress` (in flight) or it already has an open PR.
+     - Skip it if it already has a LIVE executor (per the pgrep check above) or an open PR.
      - In the item's repo clone, create an isolated worktree under that repo's worktrees base:
        `git worktree add <worktrees base>/<slug> -b feat/<n>-<slug>` (branch off origin/master).
        Set Status to `In progress`.
      - Use the item's Size field to route: XS/S/M -> SMALL path, L/XL -> LARGE path (if Size is
        empty, judge from the brief).
-     - a. SMALL feature -> launch a SEPARATE backgrounded claude process (not an in-process agent,
-          so telemetry is tagged correctly) in that worktree, ALWAYS via the wrapper so the OTEL
-          usage_mode=ralph tag can't leak (never call bare `claude` for loop work):
-          `{RALPH_CLAUDE} implementer --permission-mode auto --model sonnet -p "<implement issue using /tdd, open a PR. Ignore anything labeled {IGNORE}.>"`
+     - a. SMALL feature -> launch a SEPARATE, DETACHED claude process (not an in-process agent, so
+          telemetry is tagged correctly AND it outlives this pass) in that worktree, ALWAYS via the
+          wrapper so the OTEL usage_mode=ralph tag can't leak (never call bare `claude` for loop work).
+          Detach with setsid + nohup and log to /tmp/impl-<n>.log so a later pass can reconcile it, and
+          KEEP the issue ref + branch in the prompt so the liveness `pgrep` (step 3) can find it:
+          `cd <worktree> && setsid nohup {RALPH_CLAUDE} implementer --permission-mode auto --model sonnet -p "Implement GitHub issue <owner/repo>#<n> in this worktree (branch feat/<n>-<slug>) using /tdd, then open a PR. Ignore anything labeled {IGNORE}." > /tmp/impl-<n>.log 2>&1 &`
           Done when CI is green.
      - b. LARGE feature -> spawn an Opus sub-agent (auto mode, prompt includes the ignore-`{IGNORE}`
           sentence) in that worktree to write a feature-scoped prd.json + progress files, then run
@@ -369,6 +378,9 @@ def selftest():
     # two-phase triage: product gate stamps the label before the technical phase
     assert PRODUCT_LABEL in s and "PRODUCT phase" in s and "TECHNICAL phase" in s
     assert "HTML mockup" in s  # UI features get a visual mockup in the product phase
+    # dead-executor reconciliation: In-progress items whose executor vanished must be recovered
+    assert "Reconcile" in s and "executor gone" in s and "wedges a concurrency slot" in s
+    assert "setsid nohup" in s  # SMALL executors detach so they outlive the pass
     # lock acquire -> reject second -> release
     global LOCK
     LOCK = STATE / "selftest.lock"
