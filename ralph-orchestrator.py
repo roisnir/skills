@@ -205,6 +205,19 @@ never re-open the product discussion on an item that already has it.
    PR is merged, set Status `Done` and remove its worktree with `git worktree remove`.
    One worktree/branch/PR per feature — never bundle features.
 
+4. Address review feedback. A PR in `In review` is NOT finished — the reviewer may ask for changes,
+   and nothing else in this loop watches for that. For each item with Status `In review`, inspect its
+   PR: `gh pr view <pr> -R <item repo> --json reviews,comments,commits`. If the newest HUMAN (non-AI,
+   not the executor) review or comment is NEWER than the newest commit's committedDate, the reviewer
+   spoke after the last push — that feedback is unaddressed. (If the last push is newer, the executor
+   already responded — leave it.) For each such item, up to the {CONCURRENCY} cap:
+     - Skip if it already has a LIVE executor (the worktree-cwd check from step 3) — one is on it.
+     - Set Status `In progress` (so it counts toward the cap and reconcile tracks it) and relaunch a
+       DETACHED executor in the item's EXISTING worktree — reuse the same worktree/branch/PR, NEVER
+       open a second PR:
+       `cd <worktree> && setsid nohup {RALPH_CLAUDE} implementer --permission-mode auto --model sonnet -p "Address the review feedback on PR #<pr> for issue <owner/repo>#<n> in this worktree (branch feat/<n>-<slug>). Read it with 'gh pr view <pr> -R <owner/repo> --json reviews,comments'; if the goal/approach is being questioned, reconcile the change to ONE coherent approach (do not leave half-server/half-client changes); make the fixes with /tdd, commit and push to the SAME branch, then reply to the review summarising what changed. Ignore anything labeled {IGNORE}." > /tmp/review-<pr>.log 2>&1 &`
+       On completion it `touch "{WAKE}"` and sets Status back to `In review`.
+
 All sub-agents run in auto permission mode. Keep diffs minimal. Do not touch `{IGNORE}` items.
 """
 
@@ -388,6 +401,8 @@ def selftest():
     assert "Reconcile" in s and "executor gone" in s and "wedges a concurrency slot" in s
     assert "/proc/[0-9]*/cwd" in s and "readlink" in s  # liveness via readlink on worktree cwd (eza-safe)
     assert "setsid nohup" in s  # SMALL executors detach so they outlive the pass
+    # review-feedback: In-review PRs with unaddressed human comments get re-dispatched (not stranded)
+    assert "Address review feedback" in s and "NEWER than the newest commit" in s and "SAME branch" in s
     # lock acquire -> reject second -> release
     global LOCK
     LOCK = STATE / "selftest.lock"
