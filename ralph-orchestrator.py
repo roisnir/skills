@@ -18,11 +18,13 @@ file. Upgrade path: swap the gh poll for a webhook listener if 60s latency matte
 import argparse, atexit, json, os, re, signal, subprocess, sys, time
 from pathlib import Path
 
+
 MODEL    = "opus"
 IGNORE   = "ultra-ralph"            # skip issues/PRs with this label, this session
 PRODUCT_LABEL = "product-approved"  # stamped when the product phase is agreed with the reporter
-RALPH_SH = "/data/dev/skills/ralph.sh"
-RALPH_CLAUDE = "/data/dev/skills/ralph-claude.sh"  # wrapper: always tags usage_mode=ralph
+HERE = Path(__file__).resolve().parent            # scripts ship next to this file — portable across hosts
+RALPH_SH = str(HERE / "ralph.sh")
+RALPH_CLAUDE = str(HERE / "ralph-claude.sh")      # wrapper: always tags usage_mode=ralph
 OTEL_ENDPOINT = "http://100.109.196.108:4317"
 
 POLL        = 60                   # seconds between GitHub polls
@@ -415,6 +417,9 @@ def selftest():
     assert "RTL Hebrew mockups." in s and "Done=opt9" in s and RALPH_SH in s and "CompuDesk" not in s
     # dispatched agents spawn via the wrapper so usage_mode=ralph can't leak to interactive
     assert RALPH_CLAUDE in s and "bare `claude`" in s
+    # tool paths derive from this file's dir, so the repo runs from any checkout location
+    assert RALPH_SH == str(Path(__file__).resolve().parent / "ralph.sh") and Path(RALPH_SH).exists()
+    assert Path(RALPH_CLAUDE).exists()
     # two-phase triage: product gate stamps the label before the technical phase
     assert PRODUCT_LABEL in s and "PRODUCT phase" in s and "TECHNICAL phase" in s
     assert "HTML mockup" in s  # UI features get a visual mockup in the product phase
