@@ -15,7 +15,7 @@ prompt. Everything else (OTEL endpoint, ralph.sh path, status pipeline) is globa
 ponytail: poll-based, one feature-pass per project per iteration, single global wake
 file. Upgrade path: swap the gh poll for a webhook listener if 60s latency matters.
 """
-import argparse, atexit, json, os, signal, subprocess, sys, time
+import argparse, atexit, json, os, re, signal, subprocess, sys, time
 from pathlib import Path
 
 MODEL    = "opus"
@@ -166,6 +166,11 @@ never re-open the product discussion on an item that already has it.
    - Set Status `Ready For Agent`.{notes}
 
 3. Reconcile, THEN dispatch.
+   Branch convention — an item's worktree/branch/PR is ANY branch named `<type>/<n>[-slug]` where <n>
+   is the issue number (`feat/12-x`, `fix/12-x`, `chore/12`, ...), regardless of whether GitHub shows
+   a formal issue link. Use that to decide "does this item already have a worktree/open PR?" — match
+   on the number segment, not on the `feat/` prefix, or you will double-dispatch work that already
+   has a `fix/` branch open.
    FIRST reconcile every item with Status `In progress`: confirm its executor is actually alive. The
    reliable signal is the WORKTREE, not the issue number — both SMALL (claude) and LARGE (ralph.sh)
    executors run with their cwd inside the item's worktree, but ralph.sh's argv is just `/bin/bash
@@ -297,8 +302,13 @@ def _repo_ctx(repo, path):
     return prs, wt
 
 
+def _for_issue(branch, n):
+    """True if `branch` belongs to issue n: any <type>/<n>[-slug] (feat/, fix/, chore/, ...)."""
+    return re.match(rf"[^/]+/{n}(?:[-/]|$)", branch or "") is not None
+
+
 def write_status(projects):
-    """Join project items -> worktree -> PR -> CI on the feat/<n>- branch prefix, per item's repo."""
+    """Join project items -> worktree -> PR -> CI on the <type>/<n> branch convention, per item's repo."""
     rows = ["| repo | issue | status | size/prio | worktree | PR | CI |",
             "|---|---|---|---|---|---|---|"]
     for p in projects:
@@ -309,9 +319,8 @@ def write_status(projects):
             repo = it["content"].get("repository")
             prs, wt = ctx.get(repo, ([], {}))
             n = it["content"]["number"]
-            pre = f"feat/{n}-"
-            wtp = next((q for b, q in wt.items() if b.startswith(pre)), None)
-            pr = next((q for q in prs if q["headRefName"].startswith(pre)), None)
+            wtp = next((q for b, q in wt.items() if _for_issue(b, n)), None)
+            pr = next((q for q in prs if _for_issue(q["headRefName"], n)), None)
             rows.append(f"| {repo.split('/')[-1] if repo else '—'} | #{n} {it.get('title','')[:28]} | "
                         f"{it.get('status') or '—'} | "
                         f"{it.get('size') or '—'}/{it.get('priority') or '—'} | "
@@ -401,6 +410,10 @@ def selftest():
     assert "Reconcile" in s and "executor gone" in s and "wedges a concurrency slot" in s
     assert "/proc/[0-9]*/cwd" in s and "readlink" in s  # liveness via readlink on worktree cwd (eza-safe)
     assert "setsid nohup" in s  # SMALL executors detach so they outlive the pass
+    # branch join is by number segment, so fix/ and chore/ branches count as the item's work
+    assert "<type>/<n>[-slug]" in s and "not on the `feat/` prefix" in s
+    assert _for_issue("fix/12-x", 12) and _for_issue("chore/12", 12) and _for_issue("feat/12/a", 12)
+    assert not _for_issue("feat/120-x", 12) and not _for_issue("feat/x-12", 12) and not _for_issue(None, 12)
     # review-feedback: In-review PRs with unaddressed human comments get re-dispatched (not stranded)
     assert "Address review feedback" in s and "NEWER than the newest commit" in s and "SAME branch" in s
     # lock acquire -> reject second -> release
