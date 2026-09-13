@@ -288,7 +288,12 @@ def acquire_lock():
 
 
 def _json(args):
-    return json.loads(subprocess.run(args, capture_output=True, text=True).stdout or "[]")
+    """gh -> json. Log stderr on failure: every gh error (auth, scope, rate limit) otherwise
+    arrives as an empty list and gets reported as a meaningless '0 items returned'."""
+    r = subprocess.run(args, capture_output=True, text=True)
+    if r.returncode or not r.stdout.strip():
+        log(f"!! {' '.join(args[:3])}: {r.stderr.strip()[:200] or 'empty output'}")
+    return json.loads(r.stdout or "[]")
 
 
 def _ci(rollup):
