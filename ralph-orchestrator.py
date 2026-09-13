@@ -23,7 +23,7 @@ IGNORE   = "ultra-ralph"            # skip issues/PRs with this label, this sess
 PRODUCT_LABEL = "product-approved"  # stamped when the product phase is agreed with the reporter
 RALPH_SH = "/data/dev/skills/ralph.sh"
 RALPH_CLAUDE = "/data/dev/skills/ralph-claude.sh"  # wrapper: always tags usage_mode=ralph
-OTEL_ENDPOINT = "http://192.168.11.155:4317"
+OTEL_ENDPOINT = "http://100.109.196.108:4317"
 
 POLL        = 60                   # seconds between GitHub polls
 MAX_WAIT    = 3600                 # 1 hour hard trigger
