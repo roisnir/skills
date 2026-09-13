@@ -210,18 +210,30 @@ never re-open the product discussion on an item that already has it.
    PR is merged, set Status `Done` and remove its worktree with `git worktree remove`.
    One worktree/branch/PR per feature — never bundle features.
 
-4. Address review feedback. A PR in `In review` is NOT finished — the reviewer may ask for changes,
-   and nothing else in this loop watches for that. For each item with Status `In review`, inspect its
-   PR: `gh pr view <pr> -R <item repo> --json reviews,comments,commits`. If the newest HUMAN (non-AI,
-   not the executor) review or comment is NEWER than the newest commit's committedDate, the reviewer
-   spoke after the last push — that feedback is unaddressed. (If the last push is newer, the executor
-   already responded — leave it.) For each such item, up to the {CONCURRENCY} cap:
+4. Unblock `In review` PRs. A PR in `In review` is NOT finished, and nothing else in this loop
+   watches it. For each item with Status `In review`, inspect its PR:
+   `gh pr view <pr> -R <item repo> --json reviews,comments,commits,mergeable,mergeStateStatus`.
+   TWO things strand a PR — check both:
+     a. UNADDRESSED FEEDBACK — the newest HUMAN (non-AI, not the executor) review or comment is NEWER
+        than the newest commit's committedDate, so the reviewer spoke after the last push. (If the
+        last push is newer, the executor already responded — leave it.)
+     b. STALE BRANCH — `mergeable` is `CONFLICTING` (master moved under it, usually because a sibling
+        PR merged), or `mergeStateStatus` is `BEHIND` (branch protection wants it current). Nothing
+        comments when this happens, so it never surfaces as (a) — with several PRs open off one
+        master, merging any one of them can strand the rest. `mergeable` may come back `UNKNOWN`
+        while GitHub recomputes: treat that as "no verdict", leave the item alone, the next pass
+        re-checks it.
+   For each item matching (a) or (b), up to the {CONCURRENCY} cap:
      - Skip if it already has a LIVE executor (the worktree-cwd check from step 3) — one is on it.
      - Set Status `In progress` (so it counts toward the cap and reconcile tracks it) and relaunch a
        DETACHED executor in the item's EXISTING worktree — reuse the same worktree/branch/PR, NEVER
        open a second PR:
-       `cd <worktree> && setsid nohup {RALPH_CLAUDE} implementer --permission-mode auto --model sonnet -p "Address the review feedback on PR #<pr> for issue <owner/repo>#<n> in this worktree (branch feat/<n>-<slug>). Read it with 'gh pr view <pr> -R <owner/repo> --json reviews,comments'; if the goal/approach is being questioned, reconcile the change to ONE coherent approach (do not leave half-server/half-client changes); make the fixes with /tdd, commit and push to the SAME branch, then reply to the review summarising what changed. Ignore anything labeled {IGNORE}." > /tmp/review-<pr>.log 2>&1 &`
-       On completion it `touch "{WAKE}"` and sets Status back to `In review`.
+       For (a), unaddressed feedback:
+       `cd <worktree> && setsid nohup {RALPH_CLAUDE} implementer --permission-mode auto --model sonnet -p "Address the review feedback on PR #<pr> for issue <owner/repo>#<n> in this worktree (branch <type>/<n>-<slug>). Read it with 'gh pr view <pr> -R <owner/repo> --json reviews,comments'; if the goal/approach is being questioned, reconcile the change to ONE coherent approach (do not leave half-server/half-client changes); make the fixes with /tdd, commit and push to the SAME branch, then reply to the review summarising what changed. Ignore anything labeled {IGNORE}." > /tmp/review-<pr>.log 2>&1 &`
+       For (b), stale branch — rebase only, NO feature work:
+       `cd <worktree> && setsid nohup {RALPH_CLAUDE} implementer --permission-mode auto --model sonnet -p "PR #<pr> for issue <owner/repo>#<n> no longer merges into master. In this worktree (branch <type>/<n>-<slug>): 'git fetch origin', rebase onto origin/master, and resolve every conflict KEEPING BOTH SIDES' intent — master's incoming change and this branch's feature. Change nothing else: no new features, no refactors, no drive-by fixes. Then run the test suite (see CLAUDE.md); if it fails, fix only what the rebase broke. Force-push to the SAME branch with --force-with-lease, then comment on the PR listing which files conflicted and how you resolved them. If a conflict is a genuine product decision rather than a mechanical merge, do NOT guess — comment on the PR explaining the choice needed and stop. Ignore anything labeled {IGNORE}." > /tmp/rebase-<pr>.log 2>&1 &`
+       On completion it `touch "{WAKE}"` and sets Status back to `In review` (or `Ready For Human`
+       if it stopped on a product decision).
 
 All sub-agents run in auto permission mode. Keep diffs minimal. Do not touch `{IGNORE}` items.
 """
@@ -415,7 +427,12 @@ def selftest():
     assert _for_issue("fix/12-x", 12) and _for_issue("chore/12", 12) and _for_issue("feat/12/a", 12)
     assert not _for_issue("feat/120-x", 12) and not _for_issue("feat/x-12", 12) and not _for_issue(None, 12)
     # review-feedback: In-review PRs with unaddressed human comments get re-dispatched (not stranded)
-    assert "Address review feedback" in s and "NEWER than the newest commit" in s and "SAME branch" in s
+    assert "Address the review feedback" in s and "UNADDRESSED FEEDBACK" in s and "SAME branch" in s
+    # stale-branch trigger: a sibling PR merging strands the rest, and nothing comments when it does
+    assert "mergeable,mergeStateStatus" in s and "CONFLICTING" in s and "BEHIND" in s
+    assert "UNKNOWN" in s                      # transient GitHub state must not trigger a rebase
+    assert "rebase onto origin/master" in s and "--force-with-lease" in s
+    assert "no new features" in s              # rebase executor must not smuggle in feature work
     # lock acquire -> reject second -> release
     global LOCK
     LOCK = STATE / "selftest.lock"
