@@ -115,28 +115,34 @@ def project_items(p):
 
 
 # ── instruction ────────────────────────────────────────────────────────────────
-def build_instruction(p, opts):
-    optline = ", ".join(f"{k}={v}" for k, v in opts.items())
-    owner, num = p["owner"], p["project_number"]
-    pid, fid = p["project_id"], p["status_field_id"]
-    notes = f"\n   - Project-specific notes: {p['notes']}" if p.get("notes") else ""
-    repolines = "\n".join(f"  - {r}: local clone {spec['path']}, worktrees under {spec['worktrees']}"
-                          for r, spec in p["repos"].items())
-    routing = ("This Project spans MULTIPLE repos. Every project item carries its own repo in "
-               "`content.repository` (from item-list) — do ALL git, PR, label, and worktree work in "
-               "THAT repo, using its clone/worktrees path below:" if len(p["repos"]) > 1
-               else "All items in this Project belong to one repo:")
-    return f"""You are the triage+dispatch orchestrator for GitHub Project #{num} (owner {owner}).
-Run ONE full pass over the whole board, then exit (an outer loop re-invokes you on the next trigger).
+# ponytail: the prompt is split STATIC-FIRST / VARIABLE-LAST so every project's instruction shares
+# a byte-identical multi-KB prefix and the provider can cache it. Nothing project-specific (ids,
+# repo paths, option ids, notes, the queue) may move above the Project context section, or the
+# shared prefix — and the cache hit — is lost for every project after the first.
+INSTRUCTION_PREAMBLE = f"""You are the triage+dispatch orchestrator for a GitHub Project board.
+The board, its repos, its ids and this pass's work are in the two sections at the END of this
+prompt: "Project context" and "Work queue". Read the rules here first, then act on that queue.
 
-{routing}
-{repolines}
+The board scan has ALREADY been run for you. The work queue lists EVERY item that needs action this
+pass, with the rule (`reason`) that matched it. Act ONLY on the listed items, then exit — an outer
+loop re-invokes you on the next trigger. Do NOT re-derive the board: no `gh project field-list`, no
+`gh project item-list`, no `git worktree list` sweep, no scan of every process, to decide WHAT to
+work on. That is already decided, and every id, path, status, size, worktree and PR you need in
+order to ACT is in the queue table. If the work queue is empty, do nothing and exit immediately.
+The ONE exception to all of that: if the Work queue section says UNAVAILABLE, the precomputed scan
+failed this pass — then you DO derive the board yourself, exactly as the rules below describe, and
+act on every item that matches one of them.
+You MAY still fetch the specifics of a LISTED item — its issue comments, its PR reviews — where a
+rule below tells you to; those are targeted reads of one known item, never a sweep of the board.
+Never act on an item that is not in the queue, however tempting it looks.
 
 Triage state lives in the Project Status field, NOT in labels.
-To set a status: `gh project item-edit --id <ITEM_ID> --project-id {pid} --field-id {fid} --single-select-option-id <OPT>`
-where <ITEM_ID> is the project item id from `gh project item-list {num} --owner {owner} --format json`
-and <OPT> is the option id for the target status (live ids): {optline}.
-Status pipeline (use the names exactly as above):
+To set a status:
+`gh project item-edit --id <ITEM_ID> --project-id <PROJECT_ID> --field-id <STATUS_FIELD_ID> --single-select-option-id <OPT>`
+<ITEM_ID> is the `item id` column of the work queue — already resolved for you, so never run
+`item-list` just to look one up. <PROJECT_ID>, <STATUS_FIELD_ID> and the live <OPT> option ids are
+in the Project context section below.
+Status pipeline (use the names exactly as listed there):
   Backlog (not started) / Needs Triage  -> you triage these
   Ready For Agent (ready to be picked up) -> dispatch when a human approves
   Needs Info / Ready For Human           -> needs a human
@@ -146,24 +152,48 @@ Hard rule: IGNORE every issue and PR labeled `{IGNORE}` — do not read, triage,
 Propagate it: EVERY claude process or sub-agent you spawn MUST include this sentence verbatim in
 its prompt -> "Ignore anything labeled `{IGNORE}`; never read, modify, or open a PR against it."
 
+Branch convention — an item's worktree/branch/PR is ANY branch named `<type>/<n>[-slug]` where <n>
+is the issue number (`feat/12-x`, `fix/12-x`, `chore/12`, ...), regardless of whether GitHub shows
+a formal issue link. The scan already joined on that convention: the queue's `worktree` and `PR`
+columns are matched on the number segment, not on the `feat/` prefix, so an item whose work lives
+on a `fix/` or `chore/` branch already shows it and you will not double-dispatch work that is
+already open. Use the same convention for any branch you create.
+
+Concurrency cap — at most {CONCURRENCY} features in flight per project, one worktree each, so
+several can run concurrently. Only items with a LIVE executor count toward the cap. Before
+launching ANY executor, count the live ones — ONE command, not a board sweep. Both SMALL (claude)
+and LARGE (ralph.sh) executors run with their cwd inside their item's worktree, but ralph.sh's argv
+is just `/bin/bash ralph.sh` with no issue ref, so a `pgrep` for an issue number gives false
+readings; use readlink over /proc (NOT `ls`, which on this host is eza and dereferences the link):
+`{{ for f in /proc/[0-9]*/cwd; do readlink "$f"; done; }} 2>/dev/null | grep -F "<worktrees base>" | sort -u | wc -l`
+If that is already {CONCURRENCY} or more, launch nothing this pass (slots full) and leave the queued
+items for the next pass; otherwise launch at most ({CONCURRENCY} - count) executors. NEVER leave an
+item whose executor is gone sitting in `In progress` — it wedges a concurrency slot forever (this is
+the #1 failure mode); the `reconcile` rule is what prevents that.
+
 Triage is TWO phases: agree on WHAT the feature is with the reporter (product), THEN plan HOW it
 fits the codebase (technical). The `{PRODUCT_LABEL}` label marks that the product phase is settled —
 never re-open the product discussion on an item that already has it.
 
-1. PRODUCT phase — for items with Status `Backlog` or `Needs Triage` that do NOT have the
-   `{PRODUCT_LABEL}` label (use /triage): agree on WHAT the feature is, in plain language, BEFORE any
-   technical detail. Post a "Product Brief" comment — Problem / Who it affects / What "done" looks
-   like to a user / Out of scope — describe BEHAVIOUR, not implementation (no files, APIs, or
-   architecture). For a UI feature, ALSO post a self-contained HTML mockup of the feature inline in
-   the comment so the reporter can see and agree on the look and layout before anything is built
-   (the mockup is a visual, not implementation — the one allowed exception to "no code"); follow the
-   item's repo CLAUDE.md for mockup conventions (e.g. language/RTL). End by asking the reporter to
-   confirm or correct. Set Status `Needs Info` (ball in the reporter's court). If it is
-   too unclear to even draft one, ask the blocking question and set `Needs Info`. Use `Ready For
-   Human` for anything needing a human DECISION rather than reporter input.
+── Rules ──────────────────────────────────────────────────────────────────────
+The queue's `reason` column names exactly ONE of these per item. Apply only that rule to that item.
 
-2. TECHNICAL phase — for items with Status `Needs Info` where the reporter has replied to a Product
-   Brief: if they corrected it, revise the brief and stay `Needs Info`. If they CONFIRMED, then:
+`product` — PRODUCT phase. The item is `Backlog`/`Needs Triage` without the `{PRODUCT_LABEL}` label
+  (use /triage): agree on WHAT the feature is, in plain language, BEFORE any technical detail. Post
+  a "Product Brief" comment — Problem / Who it affects / What "done" looks like to a user / Out of
+  scope — describe BEHAVIOUR, not implementation (no files, APIs, or architecture). For a UI
+  feature, ALSO post a self-contained HTML mockup of the feature inline in the comment so the
+  reporter can see and agree on the look and layout before anything is built (the mockup is a
+  visual, not implementation — the one allowed exception to "no code"); follow the item's repo
+  CLAUDE.md for mockup conventions (e.g. language/RTL). End by asking the reporter to confirm or
+  correct. Set Status `Needs Info` (ball in the reporter's court). If it is too unclear to even
+  draft one, ask the blocking question and set `Needs Info`. Use `Ready For Human` for anything
+  needing a human DECISION rather than reporter input.
+
+`technical` — TECHNICAL phase. The item is `Needs Info` and the reporter has replied to a Product
+  Brief. Read the actual reply first — targeted, one item:
+  `gh issue view <n> -R <item repo> --comments`.
+  If they corrected the brief, revise it and stay `Needs Info`. If they CONFIRMED, then:
    - Stamp the agreement on the item's repo: `gh issue edit <n> -R <item repo> --add-label
      {PRODUCT_LABEL}` (create it first if missing: `gh label create {PRODUCT_LABEL} -R <item repo>
      --color 0E8A16 --description "product requirements agreed with reporter" 2>/dev/null || true`).
@@ -172,79 +202,110 @@ never re-open the product discussion on an item that already has it.
      Product Brief. Follow the item's repo CLAUDE.md conventions. If too large for one PR, split with
      /to-issues. If it needs coordinated changes across repos, split into one linked issue per repo
      (sequenced by dependency) — never one PR spanning repos.
-   - Set Status `Ready For Agent`.{notes}
+   - Set Status `Ready For Agent`.
 
-3. Reconcile, THEN dispatch.
-   Branch convention — an item's worktree/branch/PR is ANY branch named `<type>/<n>[-slug]` where <n>
-   is the issue number (`feat/12-x`, `fix/12-x`, `chore/12`, ...), regardless of whether GitHub shows
-   a formal issue link. Use that to decide "does this item already have a worktree/open PR?" — match
-   on the number segment, not on the `feat/` prefix, or you will double-dispatch work that already
-   has a `fix/` branch open.
-   FIRST reconcile every item with Status `In progress`: confirm its executor is actually alive. The
-   reliable signal is the WORKTREE, not the issue number — both SMALL (claude) and LARGE (ralph.sh)
-   executors run with their cwd inside the item's worktree, but ralph.sh's argv is just `/bin/bash
-   ralph.sh` with no issue ref, so a `pgrep` for the issue number gives false "dead" readings. An
-   executor is LIVE if a running process has its cwd at/under the item's worktree — check with
-   readlink (NOT `ls`, which on this host is eza and dereferences the symlink):
-   `{{ for f in /proc/[0-9]*/cwd; do readlink "$f"; done; }} 2>/dev/null | grep -qF "<worktree-path>"`
-   — OR the item has an open PR.
-   If NEITHER, the executor died (crash, quota, host restart): post a
-   one-line "⚠️ executor gone — re-dispatching" note, `git worktree remove --force` any stale worktree,
-   and set the item back to `Ready For Agent` so it re-enters dispatch below. NEVER leave a dead item
-   `In progress` — it wedges a concurrency slot forever (this is the #1 failure mode).
-   THEN dispatch: for each item with Status `Ready For Agent` that ALSO has a human (non-AI-generated)
-   comment saying "approved". Each feature is implemented in its OWN git worktree, in the item's repo,
-   so several can run concurrently. Count only items with a LIVE `In progress` executor toward the cap;
-   if that is already {CONCURRENCY} or more, dispatch nothing this pass (slots full).
-   For each approvable item, up to the {CONCURRENCY} cap:
-     - Skip it if it already has a LIVE executor (per the worktree-cwd check above) or an open PR.
-     - In the item's repo clone, create an isolated worktree under that repo's worktrees base:
-       `git worktree add <worktrees base>/<slug> -b feat/<n>-<slug>` (branch off origin/master).
-       Set Status to `In progress`.
-     - Use the item's Size field to route: XS/S/M -> SMALL path, L/XL -> LARGE path (if Size is
-       empty, judge from the brief).
-     - a. SMALL feature -> launch a SEPARATE, DETACHED claude process (not an in-process agent, so
-          telemetry is tagged correctly AND it outlives this pass) in that worktree, ALWAYS via the
-          wrapper so the OTEL usage_mode=ralph tag can't leak (never call bare `claude` for loop work).
-          Detach with setsid + nohup and log to /tmp/impl-<n>.log so a later pass can reconcile it
-          (liveness is detected by the executor's cwd = worktree, per step 3):
-          `cd <worktree> && setsid nohup {RALPH_CLAUDE} implementer --permission-mode auto --model sonnet -p "Implement GitHub issue <owner/repo>#<n> in this worktree (branch feat/<n>-<slug>) using /tdd, then open a PR. Ignore anything labeled {IGNORE}." > /tmp/impl-<n>.log 2>&1 &`
-          Done when CI is green.
-     - b. LARGE feature -> spawn an Opus sub-agent (auto mode, prompt includes the ignore-`{IGNORE}`
-          sentence) in that worktree to write a feature-scoped prd.json + progress files, then run
-          {RALPH_SH} there (its lock is per-worktree, so instances do not collide).
-          Monitor, keep status updated, open a PR, confirm CI green.
-   Every background executor must, on completion, `touch "{WAKE}"` and set the item's Status to
-   `In review` once its PR is open and CI green (or `Ready For Human` if it failed). When a feature's
-   PR is merged, set Status `Done` and remove its worktree with `git worktree remove`.
-   One worktree/branch/PR per feature — never bundle features.
+`dispatch` — the item is `Ready For Agent` and the scan found it has NO live executor and NO open
+  PR. Launch one executor for it, in its OWN git worktree in the item's repo, within the cap above.
+   - First confirm the item carries a human (non-AI-generated) comment saying "approved" — targeted,
+     one item: `gh issue view <n> -R <item repo> --comments`. If no human approved it, dispatch
+     nothing and leave it `Ready For Agent`.
+   - In the item's repo clone, create an isolated worktree under that repo's worktrees base:
+     `git worktree add <worktrees base>/<slug> -b feat/<n>-<slug>` (branch off origin/master).
+     Set Status to `In progress`.
+   - Use the queue's Size to route: XS/S/M -> SMALL path, L/XL -> LARGE path (if Size is empty,
+     judge from the brief).
+   - a. SMALL feature -> launch a SEPARATE, DETACHED claude process (not an in-process agent, so
+        telemetry is tagged correctly AND it outlives this pass) in that worktree, ALWAYS via the
+        wrapper so the OTEL usage_mode=ralph tag can't leak (never call bare `claude` for loop work).
+        Detach with setsid + nohup and log to /tmp/impl-<n>.log so a later pass can reconcile it
+        (the next scan detects liveness by the executor's cwd = worktree, per the cap above):
+        `cd <worktree> && setsid nohup {RALPH_CLAUDE} implementer --permission-mode auto --model sonnet -p "Implement GitHub issue <owner/repo>#<n> in this worktree (branch feat/<n>-<slug>) using /tdd, then open a PR. Ignore anything labeled {IGNORE}." > /tmp/impl-<n>.log 2>&1 &`
+        Done when CI is green.
+   - b. LARGE feature -> spawn an Opus sub-agent (auto mode, prompt includes the ignore-`{IGNORE}`
+        sentence) in that worktree to write a feature-scoped prd.json + progress files, then run
+        {RALPH_SH} there (its lock is per-worktree, so instances do not collide).
+        Monitor, keep status updated, open a PR, confirm CI green.
+  Every background executor must, on completion, `touch "{WAKE}"` and set the item's Status to
+  `In review` once its PR is open and CI green (or `Ready For Human` if it failed). When a feature's
+  PR is merged, set Status `Done` and remove its worktree with `git worktree remove`.
+  One worktree/branch/PR per feature — never bundle features.
 
-4. Unblock `In review` PRs. A PR in `In review` is NOT finished, and nothing else in this loop
-   watches it. For each item with Status `In review`, inspect its PR:
-   `gh pr view <pr> -R <item repo> --json reviews,comments,commits,mergeable,mergeStateStatus`.
-   TWO things strand a PR — check both:
-     a. UNADDRESSED FEEDBACK — the newest HUMAN (non-AI, not the executor) review or comment is NEWER
-        than the newest commit's committedDate, so the reviewer spoke after the last push. (If the
-        last push is newer, the executor already responded — leave it.)
-     b. STALE BRANCH — `mergeable` is `CONFLICTING` (master moved under it, usually because a sibling
-        PR merged), or `mergeStateStatus` is `BEHIND` (branch protection wants it current). Nothing
-        comments when this happens, so it never surfaces as (a) — with several PRs open off one
-        master, merging any one of them can strand the rest. `mergeable` may come back `UNKNOWN`
-        while GitHub recomputes: treat that as "no verdict", leave the item alone, the next pass
-        re-checks it.
-   For each item matching (a) or (b), up to the {CONCURRENCY} cap:
-     - Skip if it already has a LIVE executor (the worktree-cwd check from step 3) — one is on it.
-     - Set Status `In progress` (so it counts toward the cap and reconcile tracks it) and relaunch a
-       DETACHED executor in the item's EXISTING worktree — reuse the same worktree/branch/PR, NEVER
-       open a second PR:
-       For (a), unaddressed feedback:
-       `cd <worktree> && setsid nohup {RALPH_CLAUDE} implementer --permission-mode auto --model sonnet -p "Address the review feedback on PR #<pr> for issue <owner/repo>#<n> in this worktree (branch <type>/<n>-<slug>). Read it with 'gh pr view <pr> -R <owner/repo> --json reviews,comments'; if the goal/approach is being questioned, reconcile the change to ONE coherent approach (do not leave half-server/half-client changes); make the fixes with /tdd, commit and push to the SAME branch, then reply to the review summarising what changed. Ignore anything labeled {IGNORE}." > /tmp/review-<pr>.log 2>&1 &`
-       For (b), stale branch — rebase only, NO feature work:
-       `cd <worktree> && setsid nohup {RALPH_CLAUDE} implementer --permission-mode auto --model sonnet -p "PR #<pr> for issue <owner/repo>#<n> no longer merges into master. In this worktree (branch <type>/<n>-<slug>): 'git fetch origin', rebase onto origin/master, and resolve every conflict KEEPING BOTH SIDES' intent — master's incoming change and this branch's feature. Change nothing else: no new features, no refactors, no drive-by fixes. Then run the test suite (see CLAUDE.md); if it fails, fix only what the rebase broke. Force-push to the SAME branch with --force-with-lease, then comment on the PR listing which files conflicted and how you resolved them. If a conflict is a genuine product decision rather than a mechanical merge, do NOT guess — comment on the PR explaining the choice needed and stop. Ignore anything labeled {IGNORE}." > /tmp/rebase-<pr>.log 2>&1 &`
-       On completion it `touch "{WAKE}"` and sets Status back to `In review` (or `Ready For Human`
-       if it stopped on a product decision).
+`reconcile` — the item is `In progress` but its executor is GONE: the scan found no process with its
+  cwd at/under the item's worktree AND no open PR, so it died (crash, quota, host restart). Post a
+  one-line "⚠️ executor gone — re-dispatching" note on the issue, `git worktree remove --force` the
+  stale worktree (the queue's `worktree` column), and set Status back to `Ready For Agent`. Then, if
+  the cap allows, re-dispatch it in THIS pass with the `dispatch` procedure above — the human
+  approval that started it the first time still stands, so do not ask for a fresh one.
+
+`review-feedback` — the item is `In review` with UNADDRESSED FEEDBACK: the newest HUMAN (non-AI, not
+  the executor) review or comment on its PR is NEWER than the newest commit's committedDate, so the
+  reviewer spoke after the last push and nothing else in this loop watches it. (The scan compared
+  those dates via `gh pr view <pr> -R <item repo> --json commits,reviews,comments,mergeable,mergeStateStatus`;
+  had the last push been newer, the executor already responded and the item would not be queued.)
+  Read the feedback itself — targeted, one PR: `gh pr view <pr> -R <item repo> --json reviews,comments`.
+  Set Status `In progress` (so it counts toward the cap and `reconcile` tracks it) and relaunch a
+  DETACHED executor in the item's EXISTING worktree — reuse the same worktree/branch/PR, NEVER open
+  a second PR:
+  `cd <worktree> && setsid nohup {RALPH_CLAUDE} implementer --permission-mode auto --model sonnet -p "Address the review feedback on PR #<pr> for issue <owner/repo>#<n> in this worktree (branch <type>/<n>-<slug>). Read it with 'gh pr view <pr> -R <owner/repo> --json reviews,comments'; if the goal/approach is being questioned, reconcile the change to ONE coherent approach (do not leave half-server/half-client changes); make the fixes with /tdd, commit and push to the SAME branch, then reply to the review summarising what changed. Ignore anything labeled {IGNORE}." > /tmp/review-<pr>.log 2>&1 &`
+
+`stale-branch` — the item is `In review` and its PR no longer merges: the queue's `PR` column shows
+  `mergeable` = `CONFLICTING` (master moved under it, usually because a sibling PR merged) or
+  `mergeStateStatus` = `BEHIND` (branch protection wants it current). Nothing comments when this
+  happens, so it never surfaces as `review-feedback` — with several PRs open off one master, merging
+  any one of them can strand the rest. `mergeable` may also read `UNKNOWN` while GitHub recomputes:
+  that is "no verdict", never a rebase trigger — if a queued row shows `UNKNOWN`, leave that item
+  alone and let the next pass re-check it.
+  Set Status `In progress` and relaunch a DETACHED executor in the EXISTING worktree — rebase only,
+  NO feature work, same branch/PR:
+  `cd <worktree> && setsid nohup {RALPH_CLAUDE} implementer --permission-mode auto --model sonnet -p "PR #<pr> for issue <owner/repo>#<n> no longer merges into master. In this worktree (branch <type>/<n>-<slug>): 'git fetch origin', rebase onto origin/master, and resolve every conflict KEEPING BOTH SIDES' intent — master's incoming change and this branch's feature. Change nothing else: no new features, no refactors, no drive-by fixes. Then run the test suite (see CLAUDE.md); if it fails, fix only what the rebase broke. Force-push to the SAME branch with --force-with-lease, then comment on the PR listing which files conflicted and how you resolved them. If a conflict is a genuine product decision rather than a mechanical merge, do NOT guess — comment on the PR explaining the choice needed and stop. Ignore anything labeled {IGNORE}." > /tmp/rebase-<pr>.log 2>&1 &`
+  On completion it `touch "{WAKE}"` and sets Status back to `In review` (or `Ready For Human` if it
+  stopped on a product decision).
 
 All sub-agents run in auto permission mode. Keep diffs minimal. Do not touch `{IGNORE}` items.
+"""
+
+
+def _queue_table(queue):
+    """One row per actionable item — everything the pass needs to ACT without re-scanning the board
+    (the item id is here so `item-edit` never costs an `item-list`)."""
+    if queue is None:   # scan failed; the gate fails open, so the pass runs WITHOUT a queue
+        return ("UNAVAILABLE — the board scan failed this pass (transient `gh` error). Derive the "
+                "board yourself (`gh project item-list`, the worktree/PR join, the liveness check) "
+                "and act on every item matching a rule above.")
+    if not queue:
+        return "(empty — the scan found nothing actionable. Do nothing and exit.)"
+    rows = ["| repo | issue | item id | title | status | size/prio | worktree | PR | reason |",
+            "|---|---|---|---|---|---|---|---|---|"]
+    for b in queue:
+        pr = (f"#{b.pr['number']} {b.pr.get('mergeable') or '?'}/{b.pr.get('mergeStateStatus') or '?'} "
+              f"CI:{b.pr.get('ci') or '?'}") if b.pr else "—"
+        rows.append(f"| {b.repo or '—'} | #{b.number} | {b.item_id} | {b.title[:60]} | "
+                    f"{b.status or '—'} | {b.size or '—'}/{b.priority or '—'} | "
+                    f"{b.worktree or '—'} | {pr} | {b.reason} |")
+    return "\n".join(rows)
+
+
+def build_instruction(p, opts, queue):
+    """Static rules first (cacheable prefix), then this project's ids/paths/notes and its queue."""
+    optline = ", ".join(f"{k}={v}" for k, v in opts.items())
+    notes = f"\nProject-specific notes: {p['notes']}" if p.get("notes") else ""
+    repolines = "\n".join(f"  - {r}: local clone {spec['path']}, worktrees under {spec['worktrees']}"
+                          for r, spec in p["repos"].items())
+    routing = ("This Project spans MULTIPLE repos. Every work-queue row carries its own repo in the "
+               "`repo` column — do ALL git, PR, label, and worktree work in THAT repo, using its "
+               "clone/worktrees path here:" if len(p["repos"]) > 1
+               else "All items in this Project belong to one repo:")
+    return INSTRUCTION_PREAMBLE + f"""
+── Project context ────────────────────────────────────────────────────────────
+GitHub Project #{p['project_number']}, owner {p['owner']}.
+<PROJECT_ID> = {p['project_id']}
+<STATUS_FIELD_ID> = {p['status_field_id']}
+Live Status <OPT> ids: {optline}
+{routing}
+{repolines}{notes}
+
+── Work queue ({'UNAVAILABLE' if queue is None else str(len(queue)) + ' item(s)'} to act on this pass) ──
+{_queue_table(queue)}
 """
 
 
@@ -544,13 +605,6 @@ def run_iteration(projects, scans=None):
     for p in projects:
         num = p["project_number"]
         items = scans.get(num)
-        try:
-            instruction = build_instruction(p, status_opts(p))
-        except Exception as ex:  # transient gh failure — skip this project, try again next trigger
-            log(f"!! skipping project #{num} this pass: {ex}")
-            if items is not None:
-                fresh[num] = items
-            continue
         if items is None:
             try:
                 items = scan_board(p)
@@ -559,13 +613,22 @@ def run_iteration(projects, scans=None):
                 # silently no-ops because gh hiccuped. Upgrade path: retry the scan once before giving up.
                 log(f"!! board scan failed for project #{num} ({ex}) — running the pass anyway")
                 items = None
-        if items is not None:
-            todo = actionable(items)
-            if not todo:
-                log(f"idle — nothing actionable for project #{num}")
+        # queue None == "scan unavailable, sweep the board yourself"; [] == "verifiably nothing to do".
+        # Only the first may reach the agent — an empty queue tells it to exit, so we skip instead.
+        queue = actionable(items) if items is not None else None
+        if queue is not None and not queue:
+            log(f"idle — nothing actionable for project #{num}")
+            fresh[num] = items
+            continue
+        try:
+            instruction = build_instruction(p, status_opts(p), queue)
+        except Exception as ex:  # transient gh failure — skip this project, try again next trigger
+            log(f"!! skipping project #{num} this pass: {ex}")
+            if items is not None:
                 fresh[num] = items
-                continue
-            log(f"board: {len(todo)} actionable — {', '.join(sorted({b.reason for b in todo}))}")
+            continue
+        log(f"work queue: {len(queue)} item(s) — {', '.join(sorted({b.reason for b in queue}))}"
+            if queue is not None else "work queue: unavailable — the pass will sweep the board itself")
         log(f"=== iteration: claude (opus) for project #{num} ({', '.join(p['repos'])}) ===")
         subprocess.run(
             [RALPH_CLAUDE, "PM", "-p", instruction, "--model", MODEL, "--permission-mode", "auto"],
@@ -628,11 +691,44 @@ def selftest():
     assert p["owner"] == "acme"
     assert p["repos"]["acme/widget"]["worktrees"] == "/tmp/widget-wt"
     assert p["repos"]["acme/api"]["path"] == "/tmp/api" and p["repos"]["acme/api"]["owner"] == "acme"
+    # work queue: the pass acts on a precomputed list, not on a board sweep it runs itself
+    def _item(repo, n, **kw):
+        d = dict(repo=repo, number=n, item_id=f"PVTI_{n}", title=f"item {n}", status="Backlog",
+                 size="", priority="", labels=[], worktree=None, pr=None, reason="product")
+        return BoardItem(**{**d, **kw})
+    queue = [
+        _item("acme/widget", 7, status="Ready For Agent", size="S", priority="P1", reason="dispatch"),
+        _item("acme/api", 9, status="In review", worktree="/tmp/api-wt/9-thing",
+              pr={"number": 42, "headRefName": "fix/9-thing", "mergeable": "CONFLICTING",
+                  "mergeStateStatus": "DIRTY", "ci": "pass"}, reason="stale-branch"),
+    ]
     # instruction carries every repo + ids + notes, flags multi-repo routing, no hardcoded app name
-    s = build_instruction(p, {"Done": "opt9"})
+    s = build_instruction(p, {"Done": "opt9"}, queue)
     assert "acme/widget" in s and "acme/api" in s and "/tmp/widget-wt" in s
-    assert "spans MULTIPLE repos" in s and "content.repository" in s
+    assert "spans MULTIPLE repos" in s and "`repo` column" in s   # per-item repo now comes from the queue
     assert "RTL Hebrew mockups." in s and "Done=opt9" in s and RALPH_SH in s and "CompuDesk" not in s
+    # the queue IS the pass's scope: no re-derivation of the board, and ids ready for item-edit
+    assert "Work queue (2 item(s)" in s and "Act ONLY on the listed items" in s
+    assert "board scan has ALREADY been run" in s and "`gh project item-list`, no" in s
+    assert "PVTI_7" in s and "PVTI_9" in s and "never run\n`item-list`" in s
+    assert "| acme/widget | #7 | PVTI_7 |" in s and "S/P1" in s          # repo, number, id, size/prio
+    assert "/tmp/api-wt/9-thing" in s and "#42 CONFLICTING/DIRTY CI:pass" in s
+    assert "| dispatch |" in s and "| stale-branch |" in s               # matched rule per row
+    # an empty queue renders as an explicit no-op, not as an empty table
+    s0 = build_instruction(p, {"Done": "opt9"}, [])
+    assert "Work queue (0 item(s)" in s0 and "nothing actionable" in s0
+    assert "| repo | issue | item id |" not in s0
+    # ...but queue=None is NOT the same thing: the gate fails open, and a pass that runs because the
+    # scan BROKE must be told to sweep the board itself, or fail-open silently becomes fail-closed.
+    sn = build_instruction(p, {"Done": "opt9"}, None)
+    assert "Work queue (UNAVAILABLE" in sn and "Derive the board yourself" in sn
+    assert "ONE exception" in sn and "do nothing and exit" not in sn.split("── Work queue")[1]
+    # prompt-cache shape: everything variable lives after the static rules, so any two projects
+    # (different ids, repos, notes, queue) share the whole preamble as a byte-identical prefix
+    sq = build_instruction(q, {"Ready For Agent": "opt1"}, [_item("x/y", 3)])
+    pre = os.path.commonprefix([s, sq])
+    assert pre.startswith(INSTRUCTION_PREAMBLE) and len(INSTRUCTION_PREAMBLE) > 3000, len(pre)
+    assert "acme" not in pre and "PVT" not in pre and "opt9" not in pre  # nothing project-specific leaked up
     # dispatched agents spawn via the wrapper so usage_mode=ralph can't leak to interactive
     assert RALPH_CLAUDE in s and "bare `claude`" in s
     # tool paths derive from this file's dir, so the repo runs from any checkout location
@@ -642,7 +738,7 @@ def selftest():
     assert PRODUCT_LABEL in s and "PRODUCT phase" in s and "TECHNICAL phase" in s
     assert "HTML mockup" in s  # UI features get a visual mockup in the product phase
     # dead-executor reconciliation: In-progress items whose executor vanished must be recovered
-    assert "Reconcile" in s and "executor gone" in s and "wedges a concurrency slot" in s
+    assert "`reconcile`" in s and "executor gone" in s and "wedges a concurrency slot" in s
     assert "/proc/[0-9]*/cwd" in s and "readlink" in s  # liveness via readlink on worktree cwd (eza-safe)
     assert "setsid nohup" in s  # SMALL executors detach so they outlive the pass
     # branch join is by number segment, so fix/ and chore/ branches count as the item's work
