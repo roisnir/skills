@@ -16,6 +16,8 @@ ponytail: poll-based, one feature-pass per project per iteration, single global 
 file. Upgrade path: swap the gh poll for a webhook listener if 60s latency matters.
 """
 import argparse, atexit, json, os, re, signal, subprocess, sys, time
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 
@@ -47,6 +49,11 @@ def _norm_repo(repo, val):
     spec = {"path": val} if isinstance(val, str) else dict(val)
     if not spec.get("path"):
         sys.exit(f"repo {repo} missing local path")
+    # expand ~: these go to `git -C` (no shell), where a literal ~ silently yields no worktrees,
+    # which reads as "no executor is live" in the board scan
+    spec["path"] = os.path.expanduser(spec["path"])
+    if spec.get("worktrees"):
+        spec["worktrees"] = os.path.expanduser(spec["worktrees"])
     spec.setdefault("worktrees", str(Path(spec["path"]).parent / (Path(spec["path"]).name + "-wt")))
     spec["owner"] = repo.split("/")[0]
     return spec
@@ -310,7 +317,7 @@ def _ci(rollup):
 def _repo_ctx(repo, path):
     """(open PRs, branch->worktree-path map) for one repo, for the status join."""
     prs = _json(["gh", "pr", "list", "-R", repo, "--state", "open", "--limit", "200",
-                 "--json", "number,headRefName,statusCheckRollup"])
+                 "--json", "number,headRefName,statusCheckRollup,mergeable,mergeStateStatus"])
     wt, wpath = {}, None
     for line in subprocess.run(["git", "-C", path, "worktree", "list", "--porcelain"],
                                capture_output=True, text=True).stdout.splitlines():
@@ -326,41 +333,244 @@ def _for_issue(branch, n):
     return re.match(rf"[^/]+/{n}(?:[-/]|$)", branch or "") is not None
 
 
-def write_status(projects):
-    """Join project items -> worktree -> PR -> CI on the <type>/<n> branch convention, per item's repo."""
-    rows = ["| repo | issue | status | size/prio | worktree | PR | CI |",
-            "|---|---|---|---|---|---|---|"]
+# ── board scan ─────────────────────────────────────────────────────────────────
+@dataclass
+class BoardItem:
+    """One project item, joined to its worktree/PR/CI, plus which action it needs (if any)."""
+    repo: str                 # "owner/name"
+    number: int
+    item_id: str              # project item id (for `gh project item-edit --id`)
+    title: str
+    status: str               # project Status name; "" when unset
+    size: str                 # "" when unset
+    priority: str             # "" when unset
+    labels: list[str]
+    worktree: str | None      # path, if a <type>/<n> worktree exists
+    pr: dict | None           # {number, headRefName, mergeable, mergeStateStatus, ci}
+    reason: str | None        # which actionable rule matched; None = nothing to do
+
+
+# markers an agent leaves on its own comments — see _is_agent()
+AGENT_MARKS = ("🤖", "Product Brief", "Technical Plan", "executor gone", "Generated with [Claude Code]")
+PUSH_GRACE = 120   # s: an executor comments on its OWN push within ~30s — that is not review feedback
+
+
+def _proc_cwds():
+    """cwd of every running process. `readlink` over /proc (NOT `ls`, which is eza here and
+    dereferences the symlink; NOT pgrep, since ralph.sh's argv carries no issue ref)."""
+    out = set()
+    for f in Path("/proc").glob("[0-9]*/cwd"):
+        try:
+            out.add(os.readlink(f))
+        except OSError:                       # process exited mid-scan, or not ours to read
+            pass
+    return out
+
+
+def _is_live(worktree, cwds):
+    """True if some process is sitting at/under `worktree` — i.e. an executor is on this item."""
+    return bool(worktree) and any(c == worktree or c.startswith(worktree.rstrip("/") + "/") for c in cwds)
+
+
+_ME = None
+
+
+def _me():
+    """Login the orchestrator and its executors post as (cached). "" if gh cannot say — then nothing
+    counts as agent-authored, which errs toward running the pass."""
+    global _ME
+    if _ME is None:
+        d = _json(["gh", "api", "user"])
+        _ME = d.get("login", "") if isinstance(d, dict) else ""
+    return _ME
+
+
+def _is_agent(c, bot):
+    """Was this comment/review written by the loop rather than a human?
+
+    ponytail: the executors post under the operator's OWN account here, so the login alone cannot
+    tell agent from human — we additionally require an agent marker in the body, which mistakes an
+    agent comment for a human one (extra pass) rather than the reverse (silent stall). The two
+    identity-free signals (PUSH_GRACE, status_since) carry the cases markers miss. Upgrade path:
+    give the executors a dedicated bot account/app token and drop all three heuristics."""
+    login = ((c.get("author") or {}).get("login") or "")
+    return login.endswith("[bot]") or (bool(bot) and login == bot
+                                       and any(m in (c.get("body") or "") for m in AGENT_MARKS))
+
+
+def _newest(events, *keys):
+    """Newest timestamp among `events`, "" if none — ISO-8601 UTC sorts lexicographically."""
+    return max([t for e in events for k in keys if (t := str(e.get(k) or ""))], default="")
+
+
+def _after(t, ref, grace=0):
+    """True if timestamp `t` is more than `grace` seconds later than `ref` ("" = no such event)."""
+    if not t:
+        return False
+    if not ref:
+        return True
+    fix = lambda x: datetime.fromisoformat(x.replace("Z", "+00:00"))
+    return (fix(t) - fix(ref)).total_seconds() > grace
+
+
+def classify(bi, comments=(), reviews=(), commits=(), live=False, bot="", since=""):
+    """Which actionable rule `bi` matches, or None. Pure: all board state arrives as arguments.
+
+    `since` is when the item's Status was last set (see status_since)."""
+    human = [c for c in comments if not _is_agent(c, bot)]
+    if bi.status in ("Backlog", "Needs Triage") and PRODUCT_LABEL not in bi.labels:
+        return "product"
+    if bi.status == "Needs Info":               # ball is ours again once the reporter has replied
+        ours = max(_newest([c for c in comments if _is_agent(c, bot)], "createdAt"), since)
+        if _after(_newest(human, "createdAt"), ours):
+            return "technical"
+    if bi.status == "Ready For Agent":
+        if any("approved" in (c.get("body") or "").lower() for c in human):
+            return "dispatch"
+    if bi.status == "In progress" and not live and not bi.pr:
+        return "reconcile"                      # dead executor wedging a slot — the #1 failure mode
+    if bi.status == "In review":
+        spoke = max(_newest(human, "createdAt"),
+                    _newest([r for r in reviews if not _is_agent(r, bot)], "submittedAt", "createdAt"))
+        if _after(spoke, _newest(commits, "committedDate"), PUSH_GRACE):
+            return "review-feedback"            # a reviewer spoke after the last push
+        pr = bi.pr or {}                        # UNKNOWN = GitHub still recomputing, not a verdict
+        if pr.get("mergeable") == "CONFLICTING" or pr.get("mergeStateStatus") == "BEHIND":
+            return "stale-branch"
+    return None
+
+
+def status_since(p):
+    """{project item id: when its Status was last set}, {} if the query fails.
+
+    ponytail: `Needs Info` means the ball has been in the REPORTER's court since that moment, which
+    is the only identity-free way to tell "they replied" from "we asked and nobody answered" on a
+    board where the loop comments under the operator's own login. One graphql call per project, first
+    100 items; items past that fall back to the author check alone. Upgrade path: paginate, or drop
+    this once the executors post under their own bot account."""
+    q = ('query($id:ID!){node(id:$id){... on ProjectV2{items(first:100){nodes{id '
+         'fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{updatedAt}}}}}}}')
+    d = _json(["gh", "api", "graphql", "-f", f"query={q}", "-f", f"id={p['project_id']}"])
+    nodes = [] if not isinstance(d, dict) else \
+        (((d.get("data") or {}).get("node") or {}).get("items") or {}).get("nodes") or []
+    return {n["id"]: (n.get("fieldValueByName") or {}).get("updatedAt") or "" for n in nodes}
+
+
+def _issue_comments(repo, n):
+    d = _json(["gh", "issue", "view", str(n), "-R", repo, "--json", "comments"])
+    return d.get("comments") or [] if isinstance(d, dict) else []
+
+
+def _pr_activity(repo, pr):
+    d = _json(["gh", "pr", "view", str(pr), "-R", repo, "--json", "comments,reviews,commits"])
+    if not isinstance(d, dict):
+        return [], [], []
+    return d.get("comments") or [], d.get("reviews") or [], d.get("commits") or []
+
+
+def scan_board(p):
+    """One pass of board reconnaissance for project `p`: items joined to worktree/PR/CI, classified.
+
+    The single source of board truth — write_status() renders it and run_iteration() gates on it.
+    Comments cost a gh call per item, so only the statuses whose rules need them pay for them."""
+    ctx = {repo: _repo_ctx(repo, spec["path"]) for repo, spec in p["repos"].items()}
+    cwds, bot, since, items = _proc_cwds(), _me(), status_since(p), []
+    for it in sorted(project_items(p), key=lambda x: x["content"]["number"]):
+        repo, n = it["content"].get("repository") or "", it["content"]["number"]
+        prs, wt = ctx.get(repo, ([], {}))
+        pr = next((q for q in prs if _for_issue(q["headRefName"], n)), None)
+        bi = BoardItem(
+            repo=repo, number=n, item_id=it.get("id") or "", title=it.get("title") or "",
+            status=it.get("status") or "", size=it.get("size") or "", priority=it.get("priority") or "",
+            labels=list(it.get("labels") or []),
+            worktree=next((q for b, q in wt.items() if _for_issue(b, n)), None),
+            pr=None if pr is None else {
+                "number": pr["number"], "headRefName": pr["headRefName"],
+                "mergeable": pr.get("mergeable") or "", "mergeStateStatus": pr.get("mergeStateStatus") or "",
+                "ci": _ci(pr.get("statusCheckRollup"))},
+            reason=None)
+        comments, reviews, commits = (), (), ()
+        if bi.status in ("Needs Info", "Ready For Agent"):
+            comments = _issue_comments(repo, n)
+        elif bi.status == "In review" and bi.pr:
+            comments, reviews, commits = _pr_activity(repo, bi.pr["number"])
+        bi.reason = classify(bi, comments, reviews, commits, live=_is_live(bi.worktree, cwds),
+                             bot=bot, since=since.get(bi.item_id, ""))
+        items.append(bi)
+    return items
+
+
+def actionable(items):
+    """The items that need this pass to do something."""
+    return [b for b in items if b.reason]
+
+
+def write_status(projects, scans=None):
+    """Render the board table from scan_board(). Returns {project_number: items} so a caller can
+    reuse the scan (one scan per project per wake) instead of paying for a second one."""
+    scans = dict(scans or {})
+    rows = ["| repo | issue | status | size/prio | worktree | PR | CI | why |",
+            "|---|---|---|---|---|---|---|---|"]
     for p in projects:
-        ctx = {repo: _repo_ctx(repo, spec["path"]) for repo, spec in p["repos"].items()}
-        for it in sorted(project_items(p), key=lambda x: x["content"]["number"]):
-            if it.get("status") == "Done":
+        num = p["project_number"]
+        if scans.get(num) is None:
+            try:
+                scans[num] = scan_board(p)
+            except Exception as ex:      # transient gh failure — render the rest of the board
+                log(f"!! status: board scan failed for project #{num}: {ex}")
+                scans.pop(num, None)
                 continue
-            repo = it["content"].get("repository")
-            prs, wt = ctx.get(repo, ([], {}))
-            n = it["content"]["number"]
-            wtp = next((q for b, q in wt.items() if _for_issue(b, n)), None)
-            pr = next((q for q in prs if _for_issue(q["headRefName"], n)), None)
-            rows.append(f"| {repo.split('/')[-1] if repo else '—'} | #{n} {it.get('title','')[:28]} | "
-                        f"{it.get('status') or '—'} | "
-                        f"{it.get('size') or '—'}/{it.get('priority') or '—'} | "
-                        f"{Path(wtp).name if wtp else '—'} | "
-                        f"{'#'+str(pr['number']) if pr else '—'} | "
-                        f"{_ci(pr['statusCheckRollup']) if pr else '—'} |")
+        for b in scans[num]:
+            if b.status == "Done":
+                continue
+            rows.append(f"| {b.repo.split('/')[-1] if b.repo else '—'} | #{b.number} {b.title[:28]} | "
+                        f"{b.status or '—'} | "
+                        f"{b.size or '—'}/{b.priority or '—'} | "
+                        f"{Path(b.worktree).name if b.worktree else '—'} | "
+                        f"{'#'+str(b.pr['number']) if b.pr else '—'} | "
+                        f"{b.pr['ci'] if b.pr else '—'} | "
+                        f"{b.reason or '—'} |")
     STATUS_MD.write_text("\n".join(rows) + "\n")
     log(f"status -> {STATUS_MD}")
+    return scans
 
 
-def run_iteration(projects):
+def run_iteration(projects, scans=None):
+    """One opus pass per project — but only for projects whose board actually has something to do.
+
+    Returns {project_number: items} for the projects we did NOT run, whose scan is therefore still
+    current and can be handed to write_status()."""
+    scans, fresh = scans or {}, {}
     for p in projects:
-        log(f"=== iteration: claude (opus) for project #{p['project_number']} ({', '.join(p['repos'])}) ===")
+        num = p["project_number"]
+        items = scans.get(num)
         try:
             instruction = build_instruction(p, status_opts(p))
         except Exception as ex:  # transient gh failure — skip this project, try again next trigger
-            log(f"!! skipping project #{p['project_number']} this pass: {ex}")
+            log(f"!! skipping project #{num} this pass: {ex}")
+            if items is not None:
+                fresh[num] = items
             continue
+        if items is None:
+            try:
+                items = scan_board(p)
+            except Exception as ex:
+                # ponytail: the gate fails OPEN. One wasted opus pass is far cheaper than a loop that
+                # silently no-ops because gh hiccuped. Upgrade path: retry the scan once before giving up.
+                log(f"!! board scan failed for project #{num} ({ex}) — running the pass anyway")
+                items = None
+        if items is not None:
+            todo = actionable(items)
+            if not todo:
+                log(f"idle — nothing actionable for project #{num}")
+                fresh[num] = items
+                continue
+            log(f"board: {len(todo)} actionable — {', '.join(sorted({b.reason for b in todo}))}")
+        log(f"=== iteration: claude (opus) for project #{num} ({', '.join(p['repos'])}) ===")
         subprocess.run(
             [RALPH_CLAUDE, "PM", "-p", instruction, "--model", MODEL, "--permission-mode", "auto"],
             env=env())
+    return fresh
 
 
 def wait_for_trigger(projects, seen, wake_mtime):
@@ -380,12 +590,12 @@ def main(projects):
     acquire_lock()
     WAKE.touch()
     log(f"orchestrating {len(projects)} project(s): {', '.join(r for p in projects for r in p['repos'])}")
+    scans = {}
     while True:
-        run_iteration(projects)
-        write_status(projects)
+        write_status(projects, run_iteration(projects, scans))   # re-scans only what the pass changed
         seen, wake_mtime = gh_fingerprint(projects), WAKE.stat().st_mtime  # re-baseline after our run
         reason = wait_for_trigger(projects, seen, wake_mtime)
-        write_status(projects)                                             # refresh on every wake
+        scans = write_status(projects)                           # refresh on every wake; feeds the gate
         log(f"=== trigger: {reason} ===")
 
 
@@ -404,6 +614,9 @@ def selftest():
                    "status_field_id": "F", "path": "/tmp/x"})
     assert list(q["repos"]) == ["x/y"] and q["owner"] == "x"
     assert q["repos"]["x/y"]["worktrees"] == "/tmp/x-wt"
+    h = normalize({"repo": "x/y", "project_number": 1, "project_id": "P", "status_field_id": "F",
+                   "path": "~/dev/x", "worktrees": "~/dev/x-wt"})["repos"]["x/y"]
+    assert h["path"] == os.path.expanduser("~/dev/x") and "~" not in h["worktrees"]  # `git -C` needs it
     try:
         normalize({"repo": "x/y"}); assert False, "should reject missing ids"
     except SystemExit:
@@ -443,6 +656,119 @@ def selftest():
     assert "UNKNOWN" in s                      # transient GitHub state must not trigger a rebase
     assert "rebase onto origin/master" in s and "--force-with-lease" in s
     assert "no new features" in s              # rebase executor must not smuggle in feature work
+    # ── board scan / actionable gate ──────────────────────────────────────────
+    def bi(**kw):
+        d = dict(repo="acme/widget", number=7, item_id="PVTI_x", title="t", status="", size="",
+                 priority="", labels=[], worktree=None, pr=None, reason=None)
+        return BoardItem(**{**d, **kw})
+
+    def hum(t, body="", who="reporter"):
+        return {"author": {"login": who}, "body": body, "createdAt": t, "submittedAt": t}
+
+    def bot(t, body="Product Brief\n\nProblem: ..."):
+        return {"author": {"login": "ralphbot"}, "body": body, "createdAt": t, "submittedAt": t}
+
+    B = "ralphbot"
+    T1, T2, T3 = "2026-09-16T10:00:00Z", "2026-09-16T11:00:00Z", "2026-09-16T12:00:00Z"
+    # product: untriaged and not yet product-approved
+    assert classify(bi(status="Backlog"), bot=B) == "product"
+    assert classify(bi(status="Needs Triage"), bot=B) == "product"
+    assert classify(bi(status="Backlog", labels=[PRODUCT_LABEL]), bot=B) is None
+    # technical: the reporter answered the brief (newest comment is human and newer than ours)
+    assert classify(bi(status="Needs Info"), [bot(T1), hum(T2)], bot=B) == "technical"
+    assert classify(bi(status="Needs Info"), [hum(T1), bot(T2)], bot=B) is None
+    assert classify(bi(status="Needs Info"), [], bot=B) is None
+    # ...but only if they replied AFTER we handed them the ball (status_since), not months before
+    assert classify(bi(status="Needs Info"), [hum(T1)], bot=B, since=T2) is None
+    assert classify(bi(status="Needs Info"), [hum(T3)], bot=B, since=T2) == "technical"
+    # a reply under OUR login but with no agent marker counts as human — the gate errs open
+    assert classify(bi(status="Needs Info"), [bot(T1), hum(T2, who=B)], bot=B) == "technical"
+    assert classify(bi(status="Needs Info"), [hum(T1), bot(T2, "🤖 pushed a fix")], bot=B) is None
+    # dispatch: a human approval on a Ready For Agent item (the bot approving itself is not one)
+    assert classify(bi(status="Ready For Agent"), [hum(T1, "Approved, go ahead")], bot=B) == "dispatch"
+    assert classify(bi(status="Ready For Agent"), [hum(T1, "looks fine")], bot=B) is None
+    assert classify(bi(status="Ready For Agent"), [bot(T1, "Technical Plan — approved")], bot=B) is None
+    # reconcile: In progress with neither a live executor nor an open PR = the executor died
+    assert classify(bi(status="In progress", worktree="/tmp/wt"), live=False, bot=B) == "reconcile"
+    assert classify(bi(status="In progress", worktree="/tmp/wt"), live=True, bot=B) is None
+    assert classify(bi(status="In progress", pr={"number": 3, "mergeable": "MERGEABLE"}), bot=B) is None
+    ok = {"number": 3, "headRefName": "feat/7-x", "mergeable": "MERGEABLE",
+          "mergeStateStatus": "CLEAN", "ci": "pass"}
+    # review-feedback: the reviewer spoke after the last push (but not before it)
+    assert classify(bi(status="In review", pr=ok), [hum(T3)], commits=[{"committedDate": T2}],
+                    bot=B) == "review-feedback"
+    assert classify(bi(status="In review", pr=ok), [hum(T1)], commits=[{"committedDate": T2}],
+                    bot=B) is None
+    assert classify(bi(status="In review", pr=ok), reviews=[hum(T3)],
+                    commits=[{"committedDate": T2}], bot=B) == "review-feedback"
+    assert classify(bi(status="In review", pr=ok), [bot(T3, "🤖 pushed")],
+                    commits=[{"committedDate": T2}], bot=B) is None       # our own comment isn't feedback
+    # the executor's "Addressed in <sha>" lands seconds after its own push — not review feedback
+    assert classify(bi(status="In review", pr=ok), [hum("2026-09-16T10:00:25Z", "Addressed in 1a1e3b0")],
+                    commits=[{"committedDate": T1}], bot=B) is None
+    # stale-branch: a sibling merge stranded it — nothing comments, so only merge state shows it
+    assert classify(bi(status="In review", pr={**ok, "mergeable": "CONFLICTING"}), bot=B) == "stale-branch"
+    assert classify(bi(status="In review", pr={**ok, "mergeStateStatus": "BEHIND"}), bot=B) == "stale-branch"
+    assert classify(bi(status="In review", pr={**ok, "mergeable": "UNKNOWN"}), bot=B) is None  # recomputing
+    # parked boards are exactly what the gate is for
+    assert classify(bi(status="Ready For Human"), bot=B) is None
+    assert classify(bi(status="Done"), bot=B) is None
+    parked = [bi(status="Ready For Human"), bi(status="Needs Info", number=8)]
+    todo = bi(status="Backlog", number=9)
+    for b in parked + [todo]:
+        b.reason = classify(b, bot=B)
+    assert actionable(parked) == [] and [b.number for b in actionable(parked + [todo])] == [9]
+    # liveness is cwd-at-or-under the worktree, via readlink over /proc (eza-safe, ralph.sh-safe)
+    assert _is_live("/tmp/wt", {"/tmp/wt"}) and _is_live("/tmp/wt", {"/other", "/tmp/wt/src"})
+    assert not _is_live("/tmp/wt", {"/tmp/wt-other", "/tmp/w"}) and not _is_live(None, {"/tmp/wt"})
+    assert os.getcwd() in _proc_cwds()                    # our own /proc/<pid>/cwd must resolve
+    # agent-vs-human: bots always agent; our login only when the body carries an agent marker
+    assert _is_agent({"author": {"login": "github-actions[bot]"}, "body": "ci"}, B)
+    assert not _is_agent({"author": {"login": B}, "body": "yes please"}, B)
+    assert not _is_agent({"author": {"login": "reporter"}, "body": "Product Brief"}, B)
+    assert _newest([], "createdAt") == "" and _newest([hum(T1), hum(T3)], "createdAt") == T3
+    assert _after(T2, T1) and not _after(T1, T2) and _after(T1, "") and not _after("", T1)
+    assert not _after("2026-09-16T10:00:30Z", T1, PUSH_GRACE) and _after(T2, T1, PUSH_GRACE)
+
+    class R:                                          # stand-in for subprocess.CompletedProcess
+        def __init__(self, out, rc=0):
+            self.stdout, self.returncode, self.stderr = out, rc, ""
+
+    _run = subprocess.run
+    try:                                              # status_since parses the graphql shape...
+        subprocess.run = lambda *a, **k: R(json.dumps({"data": {"node": {"items": {"nodes": [
+            {"id": "I1", "fieldValueByName": {"updatedAt": T1}}, {"id": "I2", "fieldValueByName": None}]}}}}))
+        assert status_since({"project_id": "P"}) == {"I1": T1, "I2": ""}
+        subprocess.run = lambda *a, **k: R("", 1)     # ...and degrades to the author check alone
+        assert status_since({"project_id": "P"}) == {}
+    finally:
+        subprocess.run = _run
+    # the gate itself: idle boards skip the opus pass, scan failures still run it (fail OPEN)
+    global scan_board, status_opts
+    _scan, _opts, _run, calls = scan_board, status_opts, subprocess.run, []
+    try:
+        status_opts = lambda p: {"Done": "opt9"}
+        subprocess.run = lambda *a, **k: calls.append(a)
+        proj = [normalize({"repo": "x/y", "project_number": 9, "project_id": "P",
+                           "status_field_id": "F", "path": "/tmp/x"})]
+        scan_board = lambda p: [bi(status="Ready For Human"), bi(status="Done", number=8)]
+        kept = run_iteration(proj)
+        assert calls == [], "idle board must not spawn claude"
+        assert [b.status for b in kept[9]] == ["Ready For Human", "Done"]  # scan handed to write_status
+        scan_board = lambda p: [bi(status="Backlog", reason="product")]
+        run_iteration(proj)
+        assert len(calls) == 1, "actionable board must run the pass"
+        def boom(p):
+            raise RuntimeError("gh hiccup")
+        scan_board = boom
+        run_iteration(proj)
+        assert len(calls) == 2, "fail OPEN: a broken scan must still run the pass"
+        status_opts = boom                        # status_opts failure still skips the project
+        run_iteration(proj)
+        assert len(calls) == 2
+    finally:
+        scan_board, status_opts, subprocess.run = _scan, _opts, _run
+
     # lock acquire -> reject second -> release
     global LOCK
     LOCK = STATE / "selftest.lock"
