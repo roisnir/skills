@@ -24,6 +24,7 @@ from pathlib import Path
 MODEL    = "opus"
 IGNORE   = "ultra-ralph"            # skip issues/PRs with this label, this session
 PRODUCT_LABEL = "product-approved"  # stamped when the product phase is agreed with the reporter
+AUTO_LABEL = "agent-approved"       # on an auto_approve repo: counts as approval AND licenses auto-merge
 HERE = Path(__file__).resolve().parent            # scripts ship next to this file — portable across hosts
 RALPH_SH = str(HERE / "ralph.sh")
 RALPH_CLAUDE = str(HERE / "ralph-claude.sh")      # wrapper: always tags usage_mode=ralph
@@ -56,6 +57,8 @@ def _norm_repo(repo, val):
         spec["worktrees"] = os.path.expanduser(spec["worktrees"])
     spec.setdefault("worktrees", str(Path(spec["path"]).parent / (Path(spec["path"]).name + "-wt")))
     spec["owner"] = repo.split("/")[0]
+    spec["auto_approve"] = bool(spec.get("auto_approve"))   # opt-in: AUTO_LABEL approves + merges
+    spec.setdefault("default_branch", "master")
     return spec
 
 
@@ -121,7 +124,40 @@ def build_instruction(p, opts):
     pid, fid = p["project_id"], p["status_field_id"]
     notes = f"\n   - Project-specific notes: {p['notes']}" if p.get("notes") else ""
     repolines = "\n".join(f"  - {r}: local clone {spec['path']}, worktrees under {spec['worktrees']}"
+                          + (f", default branch `{spec['default_branch']}` (use it wherever this "
+                             f"text says master)" if spec["default_branch"] != "master" else "")
+                          + (" [AUTO-APPROVE]" if spec["auto_approve"] else "")
                           for r, spec in p["repos"].items())
+    auto = [r for r, spec in p["repos"].items() if spec["auto_approve"]]
+    autoblock = "" if not auto else f"""
+
+AUTO-APPROVE repos ({", ".join(auto)}) — these rules OVERRIDE the human gates above, for items in
+those repos ONLY. Never apply `{AUTO_LABEL}` to, or auto-merge in, any other repo.
+  ESCALATION TRIGGERS — an item or PR that touches ANY of these goes to `Ready For Human` with a
+  comment naming the trigger, and is never auto-approved or auto-merged: a migration that drops or
+  rewrites existing data; auth, secrets, or internet exposure; the Claude call budget/concurrency;
+  a new external service or paid dependency; a product decision not covered by the agreed brief; a
+  major design dilemma (two reasonable approaches with lasting consequences); a slice that is L/XL
+  and cannot be split. Also follow the repo's CLAUDE.md / docs/PLAN.md guidelines.
+  - PRODUCT phase: post the Product Brief as usual, then — if no trigger applies — confirm it
+    yourself: stamp `{PRODUCT_LABEL}` and continue straight into the TECHNICAL phase in the same pass
+    (do not wait in `Needs Info`). If the brief needs the reporter's input, behave as normal.
+  - TECHNICAL phase: after the Technical Plan, if the item is XS/S/M and no trigger applies, add the
+    `{AUTO_LABEL}` label (create it if missing: `gh label create {AUTO_LABEL} -R <repo> --color
+    5319E7 --description "approved by the orchestrator under the repo guidelines" 2>/dev/null || true`)
+    and set `Ready For Agent`. `{AUTO_LABEL}` on a `Ready For Agent` item counts as the human
+    "approved" comment for dispatch.
+  - Dispatch on an `{AUTO_LABEL}` item honours "Blocked by #n" lines in the issue body: do not
+    dispatch while any blocker is still open.
+  - MERGE: every executor for an `{AUTO_LABEL}` item gets this appended to its prompt: "After the PR
+    is open and CI is green, run /code-review on the PR. Fix every important finding (/tdd), push,
+    and re-review — at most 2 fix rounds. If the review is clean and no escalation trigger applies,
+    merge with `gh pr merge <pr> --squash --delete-branch`, then follow the repo CLAUDE.md
+    post-merge verification. Otherwise comment why and set Status `Ready For Human`."
+    And on every pass: an `In review` `{AUTO_LABEL}` item whose PR has CI `pass`, is MERGEABLE, and
+    has no LIVE executor has a stranded merge step — relaunch a detached executor in its worktree
+    with just that review-and-merge instruction. After a merge: set Status `Done`, remove the
+    worktree."""
     routing = ("This Project spans MULTIPLE repos. Every project item carries its own repo in "
                "`content.repository` (from item-list) — do ALL git, PR, label, and worktree work in "
                "THAT repo, using its clone/worktrees path below:" if len(p["repos"]) > 1
@@ -244,7 +280,7 @@ never re-open the product discussion on an item that already has it.
        On completion it `touch "{WAKE}"` and sets Status back to `In review` (or `Ready For Human`
        if it stopped on a product decision).
 
-All sub-agents run in auto permission mode. Keep diffs minimal. Do not touch `{IGNORE}` items.
+All sub-agents run in auto permission mode. Keep diffs minimal. Do not touch `{IGNORE}` items.{autoblock}
 """
 
 
@@ -413,10 +449,12 @@ def _after(t, ref, grace=0):
     return (fix(t) - fix(ref)).total_seconds() > grace
 
 
-def classify(bi, comments=(), reviews=(), commits=(), live=False, bot="", since=""):
+def classify(bi, comments=(), reviews=(), commits=(), live=False, bot="", since="", auto=False):
     """Which actionable rule `bi` matches, or None. Pure: all board state arrives as arguments.
 
-    `since` is when the item's Status was last set (see status_since)."""
+    `since` is when the item's Status was last set (see status_since). `auto` = the item's repo opted
+    in to auto_approve; only then does AUTO_LABEL stand in for a human approval / license a merge."""
+    auto = auto and AUTO_LABEL in bi.labels
     human = [c for c in comments if not _is_agent(c, bot)]
     if bi.status in ("Backlog", "Needs Triage") and PRODUCT_LABEL not in bi.labels:
         return "product"
@@ -425,7 +463,7 @@ def classify(bi, comments=(), reviews=(), commits=(), live=False, bot="", since=
         if _after(_newest(human, "createdAt"), ours):
             return "technical"
     if bi.status == "Ready For Agent":
-        if any("approved" in (c.get("body") or "").lower() for c in human):
+        if auto or any("approved" in (c.get("body") or "").lower() for c in human):
             return "dispatch"
     if bi.status == "In progress" and not live and not bi.pr:
         return "reconcile"                      # dead executor wedging a slot — the #1 failure mode
@@ -437,6 +475,8 @@ def classify(bi, comments=(), reviews=(), commits=(), live=False, bot="", since=
         pr = bi.pr or {}                        # UNKNOWN = GitHub still recomputing, not a verdict
         if pr.get("mergeable") == "CONFLICTING" or pr.get("mergeStateStatus") == "BEHIND":
             return "stale-branch"
+        if auto and not live and pr.get("ci") == "pass" and pr.get("mergeable") == "MERGEABLE":
+            return "merge"                      # green + mergeable but nobody is merging it
     return None
 
 
@@ -495,7 +535,8 @@ def scan_board(p):
         elif bi.status == "In review" and bi.pr:
             comments, reviews, commits = _pr_activity(repo, bi.pr["number"])
         bi.reason = classify(bi, comments, reviews, commits, live=_is_live(bi.worktree, cwds),
-                             bot=bot, since=since.get(bi.item_id, ""))
+                             bot=bot, since=since.get(bi.item_id, ""),
+                             auto=p["repos"].get(repo, {}).get("auto_approve", False))
         items.append(bi)
     return items
 
@@ -632,6 +673,15 @@ def selftest():
     s = build_instruction(p, {"Done": "opt9"})
     assert "acme/widget" in s and "acme/api" in s and "/tmp/widget-wt" in s
     assert "spans MULTIPLE repos" in s and "content.repository" in s
+    assert "AUTO-APPROVE" not in s and AUTO_LABEL not in s      # no repo opted in -> no auto rules
+    pa = normalize({"project_number": 2, "project_id": "PID", "status_field_id": "FID",
+                    "repos": {"acme/widget": "/tmp/widget",
+                              "acme/api": {"path": "/tmp/api", "auto_approve": True,
+                                           "default_branch": "main"}}})
+    sa = build_instruction(pa, {"Done": "opt9"})
+    assert "AUTO-APPROVE repos (acme/api)" in sa and AUTO_LABEL in sa and "ESCALATION TRIGGERS" in sa
+    assert "default branch `main`" in sa and "gh pr merge" in sa and "Blocked by #n" in sa
+    assert pa["repos"]["acme/widget"]["auto_approve"] is False
     assert "RTL Hebrew mockups." in s and "Done=opt9" in s and RALPH_SH in s and "CompuDesk" not in s
     # dispatched agents spawn via the wrapper so usage_mode=ralph can't leak to interactive
     assert RALPH_CLAUDE in s and "bare `claude`" in s
@@ -710,6 +760,19 @@ def selftest():
     assert classify(bi(status="In review", pr={**ok, "mergeable": "CONFLICTING"}), bot=B) == "stale-branch"
     assert classify(bi(status="In review", pr={**ok, "mergeStateStatus": "BEHIND"}), bot=B) == "stale-branch"
     assert classify(bi(status="In review", pr={**ok, "mergeable": "UNKNOWN"}), bot=B) is None  # recomputing
+    # auto-approve: AUTO_LABEL dispatches and merges ONLY on an opted-in repo
+    A = [AUTO_LABEL]
+    assert classify(bi(status="Ready For Agent", labels=A), bot=B, auto=True) == "dispatch"
+    assert classify(bi(status="Ready For Agent", labels=A), bot=B) is None          # repo not opted in
+    assert classify(bi(status="Ready For Agent"), bot=B, auto=True) is None         # opted in, no label
+    assert classify(bi(status="In review", labels=A, pr=ok), bot=B, auto=True) == "merge"
+    assert classify(bi(status="In review", labels=A, pr=ok), bot=B, auto=True, live=True) is None
+    assert classify(bi(status="In review", labels=A, pr={**ok, "ci": "pending"}), bot=B, auto=True) is None
+    assert classify(bi(status="In review", labels=A, pr=ok), bot=B) is None
+    assert classify(bi(status="In review", pr=ok), bot=B, auto=True) is None
+    # review feedback still wins over merging
+    assert classify(bi(status="In review", labels=A, pr=ok), [hum(T3)], commits=[{"committedDate": T2}],
+                    bot=B, auto=True) == "review-feedback"
     # parked boards are exactly what the gate is for
     assert classify(bi(status="Ready For Human"), bot=B) is None
     assert classify(bi(status="Done"), bot=B) is None
