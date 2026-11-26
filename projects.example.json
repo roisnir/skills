@@ -15,7 +15,13 @@
       "status_field_id": "PVTSSF_lAHOAV4V_c4BblgNzhWVBBU",
       "repos": {
         "roisnir/telegram-ai-digest": "/data/dev/daily_news_digest/telegram-ai-digest",
-        "roisnir/weekly-newsletter": "/data/dev/daily_news_digest/weekly-storage-updates"
+        "roisnir/weekly-newsletter": "/data/dev/daily_news_digest/weekly-storage-updates",
+        "roisnir/dana-tron": {
+          "path": "/data/dev/dana-tron",
+          "worktrees": "/data/dev/dana-tron-wt",
+          "auto_approve": true,
+          "default_branch": "main"
+        }
       }
     }
   ]
