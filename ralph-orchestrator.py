@@ -252,7 +252,13 @@ never re-open the product discussion on an item that already has it.
           Monitor, keep status updated, open a PR, confirm CI green.
    Every background executor must, on completion, `touch "{WAKE}"` and set the item's Status to
    `In review` once its PR is open and CI green (or `Ready For Human` if it failed). When a feature's
-   PR is merged, set Status `Done` and remove its worktree with `git worktree remove`.
+   PR is merged, set Status `Done`, TERMINATE any process still running with its cwd at/under that
+   item's worktree (same readlink check as above; `kill` = SIGTERM; a finished executor must not
+   linger: on this host they pile up and push the machine into swap), stop any docker container that
+   executor started for tests (names containing the issue number, e.g. `<repo>-test-db-<n>`), then
+   remove its worktree with `git worktree remove`. Every executor prompt you write MUST end with:
+   "When you are finished, exit. Do not schedule wakeups, loops or monitors, and do not retry board
+   updates more than once; the orchestrator reconciles status."
    One worktree/branch/PR per feature — never bundle features.
 
 4. Unblock `In review` PRs. A PR in `In review` is NOT finished, and nothing else in this loop
@@ -778,6 +784,7 @@ def selftest():
     assert "UNKNOWN" in s                      # transient GitHub state must not trigger a rebase
     assert "rebase onto origin/master" in s and "--force-with-lease" in s
     assert "no new features" in s              # rebase executor must not smuggle in feature work
+    assert "TERMINATE any process" in s and "Do not schedule wakeups" in s  # finished executors exit
     # ── board scan / actionable gate ──────────────────────────────────────────
     def bi(**kw):
         d = dict(repo="acme/widget", number=7, item_id="PVTI_x", title="t", status="", size="",
