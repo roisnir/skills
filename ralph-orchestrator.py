@@ -365,10 +365,34 @@ def _ci(rollup):
     return "pass"
 
 
+def _rest(path):
+    """gh REST GET -> parsed JSON ([] / {} on failure). Core quota, not GraphQL: the board scan runs
+    on every wake, and GraphQL list calls with statusCheckRollup kept tripping the secondary limit."""
+    r = subprocess.run(["gh", "api", path], capture_output=True, text=True)
+    if r.returncode or not r.stdout.strip():
+        log(f"!! gh api {path[:60]}: {r.stderr.strip()[:160] or 'empty output'}")
+        return None
+    return json.loads(r.stdout)
+
+
+_MERGEABLE = {True: "MERGEABLE", False: "CONFLICTING", None: "UNKNOWN"}
+
+
+def _pr_rest(repo, n):
+    """One open PR in the GraphQL-ish shape the rest of the scan expects."""
+    d = _rest(f"repos/{repo}/pulls/{n}") or {}
+    runs = (_rest(f"repos/{repo}/commits/{(d.get('head') or {}).get('sha', 'HEAD')}/check-runs?per_page=100")
+            or {}).get("check_runs") or []
+    return {"number": n, "headRefName": (d.get("head") or {}).get("ref", ""),
+            "mergeable": _MERGEABLE.get(d.get("mergeable"), "UNKNOWN"),
+            "mergeStateStatus": (d.get("mergeable_state") or "").upper(),
+            "statusCheckRollup": [{"conclusion": (c.get("conclusion") or "").upper() or None,
+                                   "state": (c.get("status") or "").upper()} for c in runs]}
+
+
 def _repo_ctx(repo, path):
     """(open PRs, branch->worktree-path map) for one repo, for the status join."""
-    prs = _json(["gh", "pr", "list", "-R", repo, "--state", "open", "--limit", "200",
-                 "--json", "number,headRefName,statusCheckRollup,mergeable,mergeStateStatus"])
+    prs = [_pr_rest(repo, q["number"]) for q in (_rest(f"repos/{repo}/pulls?state=open&per_page=100") or [])]
     wt, wpath = {}, None
     for line in subprocess.run(["git", "-C", path, "worktree", "list", "--porcelain"],
                                capture_output=True, text=True).stdout.splitlines():
@@ -511,16 +535,21 @@ def status_since(p):
     return {n["id"]: (n.get("fieldValueByName") or {}).get("updatedAt") or "" for n in nodes}
 
 
+def _comment(c, when="created_at"):
+    return {"author": {"login": (c.get("user") or {}).get("login", "")}, "body": c.get("body") or "",
+            "createdAt": c.get(when) or "", "submittedAt": c.get(when) or ""}
+
+
 def _issue_comments(repo, n):
-    d = _json(["gh", "issue", "view", str(n), "-R", repo, "--json", "comments"])
-    return d.get("comments") or [] if isinstance(d, dict) else []
+    return [_comment(c) for c in (_rest(f"repos/{repo}/issues/{n}/comments?per_page=100") or [])]
 
 
 def _pr_activity(repo, pr):
-    d = _json(["gh", "pr", "view", str(pr), "-R", repo, "--json", "comments,reviews,commits"])
-    if not isinstance(d, dict):
-        return [], [], []
-    return d.get("comments") or [], d.get("reviews") or [], d.get("commits") or []
+    comments = _issue_comments(repo, pr)
+    reviews = [_comment(r, "submitted_at") for r in (_rest(f"repos/{repo}/pulls/{pr}/reviews?per_page=100") or [])]
+    commits = [{"committedDate": ((c.get("commit") or {}).get("committer") or {}).get("date", "")}
+               for c in (_rest(f"repos/{repo}/pulls/{pr}/commits?per_page=100") or [])]
+    return comments, reviews, commits
 
 
 def scan_board(p):
