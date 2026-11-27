@@ -297,20 +297,29 @@ def env():
 
 
 # ── triggers / state ────────────────────────────────────────────────────────────
-def gh_fingerprint(projects):
-    """{repo+kind+number: updatedAt} for open issues+PRs across every repo, excluding the ignore label."""
+def gh_fingerprint(projects, run=None):
+    """{repo#number: updatedAt} for open issues+PRs across every repo (ignore label excluded), or None
+    if ANY repo could not be read.
+
+    ponytail: REST (`/issues` lists issues AND PRs) so the 60s poll draws on the core quota, not the
+    GraphQL one the passes and executors need. None on failure is load-bearing: an empty/partial
+    fingerprint used to read as "the board changed", which fired a pass, which burned more quota,
+    which failed again — a self-sustaining rate-limit storm."""
+    run = run or subprocess.run
     fp = {}
     for p in projects:
         for repo in p["repos"]:
-            for kind in ("issue", "pr"):
-                out = subprocess.run(
-                    ["gh", kind, "list", "-R", repo, "--state", "open", "--limit", "200",
-                     "--json", "number,updatedAt,labels"],
-                    capture_output=True, text=True)
-                for it in json.loads(out.stdout or "[]"):
-                    if any(l["name"] == IGNORE for l in it.get("labels", [])):
-                        continue
-                    fp[f"{repo}{kind}{it['number']}"] = it["updatedAt"]
+            out = run(["gh", "api", "--paginate", f"repos/{repo}/issues?state=open&per_page=100",
+                       "--jq", ".[] | [.number, .updated_at, ([.labels[].name] | join(\",\"))] | @tsv"],
+                      capture_output=True, text=True)
+            if out.returncode:
+                log(f"!! fingerprint {repo}: {(out.stderr or '').strip()[:120] or 'gh failed'}")
+                return None
+            for line in (out.stdout or "").splitlines():
+                num, updated, labels = (line.split("\t") + ["", ""])[:3]
+                if IGNORE in labels.split(","):
+                    continue
+                fp[f"{repo}#{num}"] = updated
     return fp
 
 
@@ -663,8 +672,11 @@ def wait_for_trigger(projects, seen, wake_mtime):
         time.sleep(max(0, min(POLL, deadline - time.time())))
         if WAKE.exists() and WAKE.stat().st_mtime != wake_mtime:
             return "process-done"
-        if gh_fingerprint(projects) != seen:
+        fp = gh_fingerprint(projects)
+        if fp is not None and seen is not None and fp != seen:
             return "github-update"
+        if seen is None and fp is not None:      # baseline failed earlier: adopt the first good read
+            seen = fp
     return "quota-reset" if 0 < QUOTA_UNTIL <= time.time() + 1 else "1h-timer"
 
 
@@ -683,6 +695,14 @@ def main(projects):
 
 
 def selftest():
+    # fingerprint: REST rows parse, ignore label filtered, ANY failure -> None (never a fake change)
+    class _P:
+        def __init__(self, out="", rc=0): self.stdout, self.returncode, self.stderr = out, rc, "boom"
+    pj = [normalize({"repo": "x/y", "project_number": 1, "project_id": "P", "status_field_id": "F",
+                     "path": "/tmp/x"})]
+    rows = f"3\t2026-01-01T00:00:00Z\tbug\n4\t2026-01-02T00:00:00Z\t{IGNORE},x\n"
+    assert gh_fingerprint(pj, run=lambda *a, **k: _P(rows)) == {"x/y#3": "2026-01-01T00:00:00Z"}
+    assert gh_fingerprint(pj, run=lambda *a, **k: _P("", 1)) is None
     # quota parsing: wake 60s after the stated reset, in the stated tz; next day if already past
     from zoneinfo import ZoneInfo
     jt = ZoneInfo("Asia/Jerusalem")
