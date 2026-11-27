@@ -608,22 +608,64 @@ def run_iteration(projects, scans=None):
                 continue
             log(f"board: {len(todo)} actionable — {', '.join(sorted({b.reason for b in todo}))}")
         log(f"=== iteration: claude (opus) for project #{num} ({', '.join(p['repos'])}) ===")
-        subprocess.run(
-            [RALPH_CLAUDE, "PM", "-p", instruction, "--model", MODEL, "--permission-mode", "auto"],
-            env=env())
+        out = _run_pass([RALPH_CLAUDE, "PM", "-p", instruction, "--model", MODEL,
+                         "--permission-mode", "auto"])
+        global QUOTA_UNTIL
+        until = quota_reset(out or "")
+        if until:
+            QUOTA_UNTIL = max(QUOTA_UNTIL, until)
+            log(f"quota hit — will wake at {datetime.fromtimestamp(until).strftime('%H:%M')}")
     return fresh
+
+
+def _run_pass(cmd):
+    """Run one opus pass, streaming its output to our stdout; returns the output for quota parsing."""
+    proc = subprocess.Popen(cmd, env=env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    out = []
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        out.append(line)
+    proc.wait()
+    return "".join(out)
+
+
+QUOTA_UNTIL = 0.0   # epoch: when the subscription quota resets (0 = not limited)
+
+
+def quota_reset(text, now=None):
+    """Epoch to wake at (reset + 60s) if `text` carries a Claude 'hit your limit … resets 7:20am (TZ)'
+    message, else None. Unparseable reset -> None (the 1h timer still covers it)."""
+    if not re.search(r"hit your (?:\S+ )?limit", text):
+        return None
+    m = re.search(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*\(([^)]+)\)", text, re.I)
+    if not m:
+        return None
+    from zoneinfo import ZoneInfo
+    from datetime import timedelta
+    try:
+        tz = ZoneInfo(m.group(4))
+    except Exception:
+        return None
+    h = int(m.group(1)) % 12 + (12 if m.group(3).lower() == "pm" else 0)
+    cur = datetime.fromtimestamp(now if now is not None else time.time(), tz)
+    at = cur.replace(hour=h, minute=int(m.group(2) or 0), second=0, microsecond=0)
+    if at <= cur:
+        at += timedelta(days=1)
+    return at.timestamp() + 60
 
 
 def wait_for_trigger(projects, seen, wake_mtime):
     """Block until a GitHub change, a wake-file touch, or MAX_WAIT. Returns reason."""
     deadline = time.time() + MAX_WAIT
+    if QUOTA_UNTIL > time.time():                  # quota-limited: wake right after the reset instead
+        deadline = min(deadline, QUOTA_UNTIL)
     while time.time() < deadline:
-        time.sleep(POLL)
+        time.sleep(max(0, min(POLL, deadline - time.time())))
         if WAKE.exists() and WAKE.stat().st_mtime != wake_mtime:
             return "process-done"
         if gh_fingerprint(projects) != seen:
             return "github-update"
-    return "1h-timer"
+    return "quota-reset" if 0 < QUOTA_UNTIL <= time.time() + 1 else "1h-timer"
 
 
 def main(projects):
@@ -641,6 +683,16 @@ def main(projects):
 
 
 def selftest():
+    # quota parsing: wake 60s after the stated reset, in the stated tz; next day if already past
+    from zoneinfo import ZoneInfo
+    jt = ZoneInfo("Asia/Jerusalem")
+    n = datetime(2026, 11, 27, 4, 5, tzinfo=jt).timestamp()
+    msg = "You've hit your 5-hour limit · resets 7:20am (Asia/Jerusalem)"
+    assert quota_reset(msg, n) == datetime(2026, 11, 27, 7, 20, tzinfo=jt).timestamp() + 60
+    late = datetime(2026, 11, 27, 8, 0, tzinfo=jt).timestamp()
+    assert quota_reset(msg, late) == datetime(2026, 11, 28, 7, 20, tzinfo=jt).timestamp() + 60
+    assert quota_reset("You've hit your limit · resets 3pm (UTC)", n) is not None
+    assert quota_reset("all fine", n) is None and quota_reset("hit your limit, no time", n) is None
     e = env()
     assert e["OTEL_RESOURCE_ATTRIBUTES"] == "usage_mode=ralph,agent_type=PM"
     assert e["OTEL_EXPORTER_OTLP_ENDPOINT"] == OTEL_ENDPOINT
@@ -807,11 +859,11 @@ def selftest():
     finally:
         subprocess.run = _run
     # the gate itself: idle boards skip the opus pass, scan failures still run it (fail OPEN)
-    global scan_board, status_opts
-    _scan, _opts, _run, calls = scan_board, status_opts, subprocess.run, []
+    global scan_board, status_opts, _run_pass, QUOTA_UNTIL
+    _scan, _opts, _run, calls = scan_board, status_opts, _run_pass, []
     try:
         status_opts = lambda p: {"Done": "opt9"}
-        subprocess.run = lambda *a, **k: calls.append(a)
+        _run_pass = lambda cmd: calls.append(cmd) or ""
         proj = [normalize({"repo": "x/y", "project_number": 9, "project_id": "P",
                            "status_field_id": "F", "path": "/tmp/x"})]
         scan_board = lambda p: [bi(status="Ready For Human"), bi(status="Done", number=8)]
@@ -829,8 +881,14 @@ def selftest():
         status_opts = boom                        # status_opts failure still skips the project
         run_iteration(proj)
         assert len(calls) == 2
+        # a pass that hits the quota arms QUOTA_UNTIL so wait_for_trigger wakes at the reset
+        status_opts = lambda p: {"Done": "opt9"}
+        _run_pass = lambda cmd: calls.append(cmd) or "You've hit your 5-hour limit · resets 7:20am (UTC)"
+        QUOTA_UNTIL = 0.0
+        run_iteration(proj)
+        assert QUOTA_UNTIL > time.time(), "quota message must arm the reset wake"
     finally:
-        scan_board, status_opts, subprocess.run = _scan, _opts, _run
+        scan_board, status_opts, _run_pass, QUOTA_UNTIL = _scan, _opts, _run, 0.0
 
     # lock acquire -> reject second -> release
     global LOCK
